@@ -1,0 +1,1287 @@
+plan_id: ohe-skeleton
+objective: |
+  构建 OpenHarness Enterprise 企业后台系统骨架，跑通 Gateway → Scheduler → Auth/Host 全链路。
+  骨架阶段使用 noop driver，验证服务间 HTTP 通信、JWT 认证、实例创建/查询/销毁最小 API。
+  TDD 模式开发，每步先写测试再写实现。
+created_at: "2026-04-16T00:00:00Z"
+created_by: gem-planner
+status: completed
+research_confidence: high
+
+plan_metrics:
+  wave_1_task_count: 4
+  total_dependencies: 24
+  risk_score: medium
+
+tldr: |
+  Phase 0: 准备开发环境（Podman PG/Redis 容器、Python venv、依赖安装、SDK 安装 + noop+seed 验证）
+  Phase 1: 搭建 shared 公共库（含 db.py/redis.py/全 11 错误码） + API-to-SDK 映射层 + 7 个微服务骨架
+  Phase 2: 实现 Gateway JWT 中间件 + Auth 服务(API Key 登录+logout) + Host 服务(API-to-SDK 映射) + Scheduler 星型路由
+  Phase 3: 跑通全链路 E2E 验证（login → JWT → agents → create → get → delete，含过期 token 场景）
+  Phase 4: 模块化填充 memory/market/billing 骨架 API + 集成测试覆盖
+
+open_questions:
+  - "supervisor 是否已安装，还是使用 PowerShell 启动脚本代替？建议骨架阶段用 PowerShell 脚本启动各服务，减少依赖"
+  - "[已决策] 骨架阶段 auth 用内存 dict 存储 API Key，不引入 DB 持久化；Phase 4 memory 服务时再引入 Alembic（第一个真正需要持久化的服务）"
+  - "[已决策] SDK InstanceCreateRequest.template_dir 必填问题：Host 服务预创建 /tmp/ohent-templates/default/ 空目录，allowed_roots 设为 ['/tmp/ohent']"
+
+pre_mortem:
+  overall_risk_level: medium
+  critical_failure_modes:
+    - scenario: "Podman 容器启动失败或 PostgreSQL/Redis 连接不通"
+      likelihood: medium
+      impact: high
+      mitigation: "Phase 0 验证步骤包含独立容器连接测试；提供备用 SQLite + fakeredis 方案降级"
+    - scenario: "服务间 HTTP 通信端口冲突或路由配置错误"
+      likelihood: medium
+      impact: medium
+      mitigation: "shared/config.py 统一端口分配；每个服务启动时打印端口信息；health endpoint 优先验证"
+    - scenario: "JWT token 跨服务验证不一致（网关签发 vs auth 服务签发）"
+      likelihood: medium
+      impact: high
+      mitigation: "JWT 工具函数统一放在 ohent_shared/security.py；所有服务引用同一模块；auth 服务负责签发，网关负责验证"
+    - scenario: "SDK OrchestratorClient noop driver 接口变更导致 Host 服务集成失败"
+      likelihood: low
+      impact: high
+      mitigation: "Phase 0 验证 SDK noop driver 可正常创建实例；Host 服务对 SDK 调用做 try/except 包装"
+    - scenario: "noop driver apply_seed() 执行真实文件 I/O，template_dir 不在 allowed_roots 时抛 SEED_PATH_UNSAFE"
+      likelihood: medium
+      impact: high
+      mitigation: "Host 服务启动时预创建 /tmp/ohent-templates/default/ 空目录；allowed_roots 配置为 ['/tmp/ohent']；ohent-env-sdk-verify 任务中增加 noop+seed 验证用例"
+    - scenario: "SQLAlchemy async session 在测试中未正确清理导致表锁或连接泄漏"
+      likelihood: medium
+      impact: medium
+      mitigation: "测试使用独立的 test database + 每个测试用例 async session 工厂 + fixture 级别 cleanup"
+  assumptions:
+    - "本地已安装 Podman（用户确认）"
+    - "Python 3.11+ 已可用（用户确认）"
+    - "骨架阶段使用 noop driver，无需真实容器环境"
+    - "服务间通信全部使用 HTTP（无 gRPC）"
+    - "Celery 在骨架阶段用同步函数模拟，不启动 worker"
+    - "前端不在本次规划范围内"
+    - "骨架阶段 auth 用内存 dict 存储 API Key，不引入 DB 持久化"
+    - "Phase 4 memory 服务时再引入 Alembic 迁移（第一个真正需要持久化的服务）"
+    - "noop driver 的 template_dir 使用预创建的空目录 /tmp/ohent-templates/default/"
+
+implementation_specification:
+  code_structure: |
+    services/
+    ├── shared/              # ohent_shared 公共库
+    │   └── src/ohent_shared/
+    │       ├── config.py        # Pydantic Settings 基类 + 端口常量 + DEFAULT_API_KEYS
+    │       ├── security.py      # JWT 签发/验证/刷新 (payload 含 permissions 字段)
+    │       ├── errors.py        # 统一 11 个错误码枚举 + OHError 异常类 + 错误响应模型
+    │       ├── responses.py     # 统一响应包装器 (data/items/ok/error)
+    │       ├── db.py            # async engine + session 工厂 (完整实现，骨架阶段备用)
+    │       ├── redis.py         # Redis 连接工厂 (完整实现，骨架阶段备用)
+    │       ├── schemas.py       # 公共 Pydantic 模型 (RequestContext, PaginatedResponse)
+    │       └── service_client.py # 服务间 HTTP 调用封装 (含 X-Org-ID 头透传)
+    ├── gateway/
+    │   └── src/gateway/
+    │       ├── main.py          # FastAPI app + lifespan + 中间件
+    │       ├── config.py        # Gateway 配置 (路由表、端口)
+    │       ├── middleware.py     # JWT 认证中间件 + request_id 注入
+    │       └── proxy.py         # 请求转发到后端服务
+    ├── auth/
+    │   └── src/auth/
+    │       ├── main.py
+    │       ├── config.py
+    │       ├── models.py        # ApiKey ORM 模型 (骨架用内存 dict)
+    │       ├── schemas.py       # LoginRequest, TokenResponse
+    │       ├── api/v1/auth.py   # login/refresh/me 路由
+    │       └── service.py       # API Key 验证 + JWT 签发逻辑
+    ├── host/
+    │   └── src/host/
+    │       ├── main.py
+    │       ├── config.py
+    │       ├── api/v1/agents.py # agents CRUD 路由
+    │       └── service.py       # OrchestratorClient 封装
+    ├── scheduler/
+    │   └── src/scheduler/
+    │       ├── main.py
+    │       ├── config.py
+    │       ├── api/v1/agents.py # 转发到 host 的代理路由
+    │       └── proxy.py         # 服务路由转发逻辑
+    ├── memory/
+    │   └── src/memory/
+    │       ├── main.py
+    │       ├── config.py
+    │       └── api/v1/assets.py # 骨架: GET /health only
+    ├── market/
+    │   └── src/market/
+    │       ├── main.py
+    │       ├── config.py
+    │       └── api/v1/templates.py # 骨架: GET /health only
+    └── billing/
+        └── src/billing/
+            ├── main.py
+            ├── config.py
+            └── api/v1/usage.py # 骨架: GET /health only
+
+    scripts/
+    └── dev_start.ps1           # PowerShell 一键启动所有服务
+    tests/
+    └── e2e_full_chain.py       # 全链路 E2E 测试
+
+  affected_areas:
+    - "OpenHarnessEnterprise/services/ (新建全部服务骨架)"
+    - "OpenHarnessEnterprise/scripts/ (新建启动脚本)"
+    - "OpenHarnessEnterprise/tests/ (新建测试)"
+
+  component_details:
+    - component: "ohent_shared"
+      responsibility: "提供所有服务共享的工具函数、配置基类、安全工具、响应格式、DB/Redis 连接工厂"
+      interfaces:
+        - "create_access_token(data, expires_delta) -> str"
+        - "decode_token(token) -> dict"
+        - "create_refresh_token(data, expires_delta) -> str"
+        - "OHError(code, message, status_code) -> HTTPException"
+        - "ok_response() -> dict"
+        - "data_response(data) -> dict"
+        - "error_response(code, message, request_id, details) -> dict"
+        - "get_db() -> AsyncGenerator[AsyncSession]"
+        - "get_redis() -> Redis"
+        - "ServiceClient.call(service, method, path, ctx) -> dict"
+    - component: "gateway"
+      responsibility: "API 网关，接收外部请求，JWT 验证。auth 路由直连 auth 服务，其余全部转发到 scheduler（星型拓扑）"
+      interfaces:
+        - "GET /health -> { status: 'ok' }"
+        - "POST /api/v1/auth/* -> proxy to auth service (直连)"
+        - "ALL /api/v1/* (except auth) -> proxy to scheduler service"
+    - component: "auth"
+      responsibility: "API Key 验证，JWT 签发和刷新，登出，用户信息查询。启动时自动加载 DEFAULT_API_KEYS 预置 key"
+      interfaces:
+        - "GET /health -> { status: 'ok' }"
+        - "POST /api/v1/auth/login(body: {api_key}) -> {token, refresh_token, expires_at, user}"
+        - "POST /api/v1/auth/refresh(body: {refresh_token}) -> {token, expires_at} (过期返回 details: {refresh_expired: true})"
+        - "POST /api/v1/auth/logout -> {ok: true}"
+        - "GET /api/v1/auth/me -> {id, name, role, org_id, permissions}"
+    - component: "host"
+      responsibility: "通过 API-to-SDK 映射层将外部 API 请求转换为 SDK InstanceCreateRequest 调用。自动生成 workspace_root=/tmp/ohent/{name}-{uuid}，预置默认模板 /tmp/ohent-templates/default/"
+      interfaces:
+        - "GET /health -> { status: 'ok' }"
+        - "GET /internal/agents -> {items, total}"
+        - "POST /internal/agents(body: {name, template_id?, agent_config_id?, model, config}) -> {data: {instance}}"
+        - "GET /internal/agents/{id} -> {data: {instance}}"
+        - "DELETE /internal/agents/{id} -> {ok: true}"
+        - "POST /internal/agents/{id}/message(body) -> {data: {result}}"
+    - component: "scheduler"
+      responsibility: "星型拓扑中心：接收网关请求，统一转发到对应后端服务（含 auth 路由）。骨架阶段转发 agents 到 host"
+      interfaces:
+        - "GET /health -> { status: 'ok' }"
+        - "GET /api/v1/agents -> proxy to host"
+        - "POST /api/v1/agents -> proxy to host"
+        - "GET /api/v1/agents/{id} -> proxy to host"
+        - "DELETE /api/v1/agents/{id} -> proxy to host"
+        - "POST /api/v1/agents/{id}/message -> proxy to host"
+        - "GET /api/v1/tasks/{task_id} -> {data: {task}}"
+        - "/api/v1/auth/* -> proxy to auth (未来扩展)"
+    - component: "memory/market/billing"
+      responsibility: "骨架阶段仅提供 health endpoint，后续模块化填充"
+      interfaces:
+        - "GET /health -> { status: 'ok' }"
+
+  dependencies:
+    - component: "gateway"
+      relationship: "依赖 ohent_shared (JWT 验证), 转发到 auth 和 scheduler"
+    - component: "auth"
+      relationship: "依赖 ohent_shared (JWT 签发)"
+    - component: "scheduler"
+      relationship: "依赖 ohent_shared (ServiceClient), 转发到 host/auth/memory/market/billing"
+    - component: "host"
+      relationship: "依赖 ohent_shared, 依赖 openharness-sdk (OrchestratorClient)"
+    - component: "memory/market/billing"
+      relationship: "依赖 ohent_shared, 骨架无其他依赖"
+
+  integration_points:
+    - "Gateway → Auth 服务: /api/v1/auth/* 路由转发"
+    - "Gateway → Scheduler 服务: /api/v1/agents/*, /api/v1/tasks/* 路由转发"
+    - "Scheduler → Host 服务: /internal/agents/* 内部调用"
+    - "Host → openharness-sdk: OrchestratorClient noop driver 实例管理"
+    - "Auth → ohent_shared/security: JWT 签发和验证"
+
+contracts:
+  - from_task: "ohent-0-shared"
+    to_task: "ohent-2-gateway"
+    interface: "ohent_shared.security (JWT 验证函数), ohent_shared.errors (全部 11 个错误码), ohent_shared.responses (响应包装)"
+    format: "Python 包 (pip install -e)"
+  - from_task: "ohent-0-shared"
+    to_task: "ohent-2-auth"
+    interface: "ohent_shared.security (JWT 签发/刷新, payload 含 permissions), ohent_shared.config (配置基类 + DEFAULT_API_KEYS), ohent_shared.responses"
+    format: "Python 包 (pip install -e)"
+  - from_task: "ohent-0-shared"
+    to_task: "ohent-2-scheduler"
+    interface: "ohent_shared.service_client (服务间调用, 含 X-Org-ID 头透传), ohent_shared.schemas (RequestContext), ohent_shared.responses"
+    format: "Python 包 (pip install -e)"
+  - from_task: "ohent-0-shared"
+    to_task: "ohent-2-host"
+    interface: "ohent_shared.errors (全部错误码), ohent_shared.responses, ohent_shared.config"
+    format: "Python 包 (pip install -e)"
+  - from_task: "ohent-0-shared-api-mapping"
+    to_task: "ohent-2-host"
+    interface: "api_to_sdk_mapping 函数: 将外部 API 请求 {name, template_id?, agent_config_id?, model, config} 转换为 SDK InstanceCreateRequest {name, host, template_id, workspace_root, seed}"
+    format: "Python 模块 (shared 内或 host 内)"
+  - from_task: "ohent-2-auth"
+    to_task: "ohent-3-gateway-auth"
+    interface: "auth 服务 HTTP API (POST /api/v1/auth/login 返回 JWT, POST /api/v1/auth/logout)"
+    format: "HTTP JSON API"
+  - from_task: "ohent-2-host"
+    to_task: "ohent-3-scheduler-host"
+    interface: "host 服务内部 HTTP API (GET/POST/DELETE /internal/agents/*)"
+    format: "HTTP JSON API"
+
+tasks:
+  # ──────────────────── Phase 0: 环境准备 ────────────────────
+  - id: "ohent-env-podman"
+    title: "启动 Podman PostgreSQL 16 + Redis 7 容器"
+    description: |
+      使用 Podman 启动 PostgreSQL 16 和 Redis 7 容器作为开发数据库和缓存。
+      - 创建 Podman 网络 ohent-net
+      - 启动 PostgreSQL: podman run --name ohent-pg -e POSTGRES_DB=oh_enterprise -e POSTGRES_USER=ohent -e POSTGRES_PASSWORD=ohent_dev -p 5432:5432 -d postgres:16
+      - 启动 Redis: podman run --name ohent-redis -p 6379:6379 -d redis:7
+      - 验证: psql 连接 + redis-cli ping
+      - 编写 PowerShell 启动脚本 scripts/setup_dev_containers.ps1
+    wave: 1
+    agent: gem-devops
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: []
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "技术选型文档，含 Podman 数据库选型决策"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 60
+    focus_area: null
+    verification:
+      - "podman ps 显示 ohent-pg 和 ohent-redis 容器运行中"
+      - "psql -U ohent -d oh_enterprise -c 'SELECT 1' 返回结果"
+      - "redis-cli ping 返回 PONG"
+    acceptance_criteria:
+      - "PostgreSQL 16 容器运行在 5432 端口，数据库 oh_enterprise 可连接"
+      - "Redis 7 容器运行在 6379 端口，ping 可达"
+      - "提供可重复执行的 PowerShell 脚本"
+    failure_modes:
+      - scenario: "Podman 未安装或版本不兼容"
+        likelihood: low
+        impact: high
+        mitigation: "脚本开头检测 podman 版本，失败时输出安装指引"
+    environment: development
+    requires_approval: false
+    devops_security_sensitive: false
+
+  - id: "ohent-env-python"
+    title: "创建 Python venv 并安装所有依赖"
+    description: |
+      在 OpenHarnessEnterprise/ 下创建 Python 3.11+ venv，安装核心依赖。
+      - 创建 .venv
+      - 安装 openharness-sdk (pip install -e ../OpenHarnessSDK)
+      - 安装公共依赖: fastapi, uvicorn, sqlalchemy[asyncio], asyncpg, greenlet, alembic, pyjwt[crypto], redis[hiredis], httpx, pydantic-settings, pytest, pytest-asyncio, httpcore
+      - 验证: python -c 'import fastapi; import sqlalchemy; import jwt; import redis; from openharness_sdk import OrchestratorClient'
+      - 创建 requirements.txt 或 pyproject.toml 记录依赖
+    wave: 1
+    agent: gem-devops
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: []
+    context_files:
+      - path: "OpenHarnessSDK/pyproject.toml"
+        description: "SDK 的 pyproject.toml，确认依赖关系"
+      - path: "docs/plan/research_backend_tech_stack.md"
+        description: "技术选型研究，含具体依赖版本推荐"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 30
+    focus_area: null
+    verification:
+      - "python -c 'import fastapi, sqlalchemy, jwt, redis, httpx' 无报错"
+      - "python -c 'from openharness_sdk import OrchestratorClient' 无报错"
+      - "pytest --version 可运行"
+    acceptance_criteria:
+      - ".venv 创建成功，包含所有依赖"
+      - "openharness-sdk 以 editable 模式安装"
+      - "所有核心 import 无报错"
+    failure_modes:
+      - scenario: "openharness-sdk 安装失败（依赖冲突或路径问题）"
+        likelihood: medium
+        impact: high
+        mitigation: "使用 pip install -e 相对路径；失败时检查 sys.path 或使用 PYTHONPATH"
+    environment: development
+    requires_approval: false
+    devops_security_sensitive: false
+
+  - id: "ohent-env-sdk-verify"
+    title: "验证 SDK OrchestratorClient noop driver + seed 功能"
+    description: |
+      编写测试脚本验证 openharness-sdk 的 noop driver 能正常工作，特别关注 seed 机制。
+      - 测试: 创建 OrchestratorClient(runtime="noop", allowed_roots=["/tmp/ohent"])
+      - 测试: 创建 /tmp/ohent-templates/default/ 空目录作为默认模板
+      - 测试: create_instance(InstanceCreateRequest(name="test", host="local", template_id="default", workspace_root="/tmp/ohent/test-xxx", seed=SeedConfig(template_dir="/tmp/ohent-templates/default"))) 返回 InstanceRecord
+      - 测试: list_instances 返回创建的实例
+      - 测试: get_instance 返回正确实例
+      - 测试: destroy_instance 返回 DestroyResult
+      - 测试: send_message 返回 MessageResult
+      - 验证: template_dir 不在 allowed_roots 时抛 SEED_PATH_UNSAFE
+      - 验证: template_dir 不存在时 noop driver 的行为（应静默跳过或正常处理）
+      - 使用 pytest 组织为测试用例
+    wave: 1
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-env-python"]
+    context_files:
+      - path: "docs/plan/openharness-sdk-research/research_findings_sdk_contract.md"
+        description: "SDK 契约研究报告，含完整 API 表面和数据模型"
+      - path: "OpenHarnessSDK/pyproject.toml"
+        description: "SDK 包配置"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "增加 noop+seed 验证：验证 template_dir 在 allowed_roots 约束下的行为"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 100
+    focus_area: null
+    verification:
+      - "pytest tests/test_sdk_noop.py 全部 PASS"
+      - "template_dir 不在 allowed_roots 时确认抛 SEED_PATH_UNSAFE"
+    acceptance_criteria:
+      - "noop driver 创建实例返回 status=ready"
+      - "list/get/destroy/message 全部正常工作"
+      - "seed 机制在 noop driver + allowed_roots 约束下正常工作"
+      - "template_dir 不在 allowed_roots 时抛出 SEED_PATH_UNSAFE 错误"
+    failure_modes:
+      - scenario: "noop driver 接口与研究报告不一致"
+        likelihood: low
+        impact: high
+        mitigation: "检查 SDK 源码 client.py 和 driver_base.py 确认实际接口"
+      - scenario: "noop driver apply_seed() 执行真实文件 I/O 导致测试环境依赖"
+        likelihood: medium
+        impact: medium
+        mitigation: "测试中预创建所需目录；使用 tempfile.mkdtemp() 隔离测试环境"
+    tech_stack:
+      - "Python 3.11+"
+      - "openharness-sdk"
+      - "pytest"
+    test_coverage: "SDK noop driver 5 个核心方法 + seed 安全边界验证"
+
+  - id: "ohent-env-project-structure"
+    title: "创建 services/ 目录结构和所有 pyproject.toml"
+    description: |
+      创建 OpenHarnessEnterprise/ 下完整的服务目录骨架和 pyproject.toml。
+      目录: shared, gateway, auth, host, scheduler, memory, market, billing
+      每个服务包含:
+      - pyproject.toml (hatchling 构建, 依赖 ohent_shared)
+      - src/{service_name}/__init__.py
+      - src/{service_name}/__main__.py
+      - src/{service_name}/main.py (FastAPI app + GET /health)
+      - src/{service_name}/config.py (Pydantic Settings)
+      - tests/test_health.py (测试 GET /health)
+      额外创建:
+      - scripts/dev_start.ps1 (启动所有服务的骨架脚本)
+      - OpenHarnessEnterprise/pyproject.toml (workspace 根配置)
+    wave: 1
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-env-python"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "需求文档，含服务架构和目录结构设计"
+      - path: "docs/plan/research_backend_tech_stack.md"
+        description: "技术选型研究，含推荐项目结构"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 300
+    focus_area: null
+    verification:
+      - "每个服务的 tests/test_health.py 通过"
+      - "python -m {service_name} 启动后 GET /health 返回 {status: 'ok'}"
+      - "dev_start.ps1 能启动所有服务"
+    acceptance_criteria:
+      - "8 个服务目录（含 shared）各有完整骨架"
+      - "每个服务可通过 python -m {name} 独立启动"
+      - "GET /health 全部返回 200"
+    failure_modes:
+      - scenario: "端口冲突导致服务无法同时启动"
+        likelihood: medium
+        impact: medium
+        mitigation: "统一端口分配: gateway=8000, auth=8001, host=8002, scheduler=8003, memory=8004, market=8005, billing=8006"
+    tech_stack:
+      - "FastAPI"
+      - "uvicorn"
+      - "pydantic-settings"
+      - "hatchling"
+    test_coverage: "每个服务 health endpoint"
+
+  # ──────────────────── Phase 1: shared 公共库 ────────────────────
+  - id: "ohent-0-shared"
+    title: "实现 ohent_shared 公共库核心模块"
+    description: |
+      TDD 实现 ohent_shared 的核心工具模块。
+      模块清单:
+      1. config.py: BaseSettings 配置基类 + 服务端口常量 + 数据库/Redis URL + DEFAULT_API_KEYS 环境变量定义
+      2. security.py: create_access_token(payload 含 permissions 字段), create_refresh_token, decode_token (使用 PyJWT)
+      3. errors.py: OHError 异常类 + 全部 11 个错误码枚举 (UNAUTHORIZED, FORBIDDEN, QUOTA_EXCEEDED, NOT_FOUND, CONFLICT, API_DEPRECATED, VALIDATION_ERROR, RATE_LIMITED, INTERNAL_ERROR, UPSTREAM_UNAVAILABLE, SERVICE_UNAVAILABLE) + error_response 生成器
+      4. responses.py: ok_response(), data_response(data), list_response(items, total, page, page_size), paginated_response()
+      5. schemas.py: RequestContext(user_id, org_id, request_id, permissions), PaginatedQuery(page, page_size), UserInfo(id, name, role, org_id, permissions)
+      6. service_client.py: ServiceClient 类 (httpx.AsyncClient 封装，自动注入 X-Internal-Call, X-Request-ID, X-Org-ID 内部调用头)
+      7. db.py: async SQLAlchemy engine + async session 工厂 (get_db dependency)。骨架阶段备用，Phase 4 memory 服务时启用
+      8. redis.py: Redis 连接工厂 (get_redis dependency)。骨架阶段备用
+      TDD: 先写 shared/tests/ 下每个模块的单元测试，再实现。
+    wave: 2
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-env-project-structure"]
+    context_files:
+      - path: "docs/plan/research_backend_tech_stack.md"
+        description: "技术选型研究，含 JWT 方案和 SQLAlchemy 模式"
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含全部 11 个错误码定义和统一响应格式"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "增加 db.py/redis.py 实现；扩展错误码到全部 11 个；增加 DEFAULT_API_KEYS；ServiceClient 增加 X-Org-ID 透传；JWT payload 增加 permissions"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 300
+    focus_area: null
+    verification:
+      - "pytest tests/ 全部 PASS (security, errors, responses, schemas, db, redis 测试)"
+      - "JWT 签发 → 解码 → 验证 round-trip 正确，payload 含 permissions"
+      - "error_response 覆盖全部 11 个错误码，输出格式匹配 api-protocol.md §2.3"
+      - "db.py async engine + session 工厂可正常导入"
+      - "redis.py 连接工厂可正常导入"
+      - "ServiceClient 注入 X-Internal-Call, X-Request-ID, X-Org-ID 头"
+    acceptance_criteria:
+      - "所有 8 个模块实现并通过测试"
+      - "JWT 支持 HS256, 包含 jti/exp/type/permissions 字段"
+      - "错误码覆盖 api-protocol.md §2.3 全部 11 个错误码"
+      - "db.py 提供 async engine + session 工厂（骨架阶段可用但非必需）"
+      - "redis.py 提供连接工厂（骨架阶段可用但非必需）"
+      - "config.py 定义 DEFAULT_API_KEYS 环境变量"
+      - "ServiceClient 支持 X-Org-ID 头透传"
+    failure_modes:
+      - scenario: "PyJWT API 使用方式与预期不同"
+        likelihood: low
+        impact: low
+        mitigation: "参考 research_backend_tech_stack.md 中的代码示例"
+    tech_stack:
+      - "PyJWT[crypto]"
+      - "httpx"
+      - "pydantic"
+      - "pydantic-settings"
+      - "sqlalchemy[asyncio]"
+      - "redis[hiredis]"
+    test_coverage: "security 签发/解码, errors 全 11 错误码, responses 全格式, schemas 序列化, db session 工厂, redis 连接, service_client 头注入"
+
+  - id: "ohent-0-shared-api-mapping"
+    title: "设计 API-to-SDK 映射层"
+    description: |
+      设计并实现外部 API 协议到 SDK InstanceCreateRequest 的映射层。
+      核心问题: api-protocol.md 定义 POST /api/v1/agents 请求体为 {name, template_id?, agent_config_id?, model, config}，
+      但 SDK InstanceCreateRequest 是 {name, host, template_id, workspace_root, seed: {mode, template_dir, custom_dir?}}。
+      template_dir 是必填字段且必须指向真实存在的目录，且必须在 allowed_roots 白名单内。
+      
+      映射逻辑:
+      1. name: 直接透传 (需验证 ^[a-z0-9-]{3,32}$)
+      2. host: 固定为 HOST_NODE_ID 环境变量或 "local"
+      3. template_id: 直接透传
+      4. workspace_root: 自动生成 /tmp/ohent/{name}-{uuid4}
+      5. seed.template_dir: 由 TEMPLATE_MAP 解析，默认 /tmp/ohent-templates/default/
+      6. seed.mode: 默认 "merge"
+      7. config 和 model: 存储在实例元数据中，noop 阶段暂不使用
+      
+      Host 服务配置:
+      - config.py 定义 TEMPLATES_DIR = "/tmp/ohent-templates" 和 TEMPLATE_MAP
+      - 启动时预创建 /tmp/ohent-templates/default/ 空目录
+      - allowed_roots 配置为 ["/tmp/ohent"]
+      
+      TDD: 先写映射函数的单元测试（含边界用例），再实现。
+    wave: 2
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-0-shared", "ohent-env-sdk-verify"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议，定义外部 POST /api/v1/agents 请求体格式"
+      - path: "docs/plan/openharness-sdk-research/research_findings_sdk_contract.md"
+        description: "SDK 契约，定义 InstanceCreateRequest 和 SeedConfig 格式"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 2
+        reason: "新增任务：解决外部 API 与 SDK InstanceCreateRequest 接口不匹配的 Blocking 问题"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 120
+    focus_area: null
+    verification:
+      - "pytest tests/test_api_mapping.py 全部 PASS"
+      - "映射函数正确转换外部 API 请求到 InstanceCreateRequest"
+      - "template_dir 解析正确映射到预创建的模板目录"
+      - "name 格式校验 ^[a-z0-9-]{3,32}$ 正确拦截非法输入"
+    acceptance_criteria:
+      - "api_to_sdk_mapping() 函数实现并通过测试"
+      - "workspace_root 自动生成 /tmp/ohent/{name}-{uuid} 格式"
+      - "template_id 到 template_dir 的映射逻辑正确"
+      - "name 格式校验符合 SDK 要求"
+    failure_modes:
+      - scenario: "SDK 的 name 正则校验比 api-protocol 更严格"
+        likelihood: low
+        impact: medium
+        mitigation: "以 SDK 的 ^[a-z0-9-]{3,32}$ 为准，在映射层提前校验并返回 VALIDATION_ERROR"
+    tech_stack:
+      - "Python 3.11+"
+      - "pydantic"
+    test_coverage: "映射函数正常用例 + 边界用例（缺少 template_id、非法 name 格式）"
+
+  # ──────────────────── Phase 2: 核心服务实现 ────────────────────
+  - id: "ohent-2-auth"
+    title: "实现 Auth 认证服务（API Key 登录 + JWT 签发 + 登出）"
+    description: |
+      TDD 实现 Auth 服务的完整认证 API。
+      功能:
+      1. 内存存储 API Key → User 映射 (骨架阶段不用 DB)
+      2. 启动时自动加载 ohent_shared.config.DEFAULT_API_KEYS 环境变量预置 API Key
+      3. POST /api/v1/auth/login: 验证 API Key，返回 access_token + refresh_token + user info (user 含 permissions)
+      4. POST /api/v1/auth/refresh: 验证 refresh_token，签发新 access_token。refresh_token 过期返回 details: {refresh_expired: true}
+      5. POST /api/v1/auth/logout: 登出操作 (骨架阶段返回 ok: true，无 token 黑名单)
+      6. GET /api/v1/auth/me: 从 JWT 提取 user_id，返回用户信息 (含 permissions)
+      7. 种子数据: 预设 3 个测试 API Key (admin/org_admin/user)，各含不同 permissions
+      TDD: 先写 tests/test_auth_api.py 测试登录/刷新/登出/查询，再实现 service.py 和路由。
+      响应格式严格对齐 api-protocol.md。
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-0-shared"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含 auth 接口定义（含 logout）和响应格式"
+      - path: "docs/plan/research_backend_tech_stack.md"
+        description: "技术选型，含 JWT 实现方案"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "增加 POST /api/v1/auth/logout 端点；增加 DEFAULT_API_KEYS 自动加载；JWT payload 增加 permissions；refresh_token 过期返回 details"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: null
+    verification:
+      - "pytest tests/test_auth_api.py 全部 PASS"
+      - "POST /api/v1/auth/login 返回 JWT + user info (含 permissions)"
+      - "POST /api/v1/auth/refresh 用 refresh_token 换新 access_token"
+      - "POST /api/v1/auth/refresh 过期 refresh_token 返回 details: {refresh_expired: true}"
+      - "POST /api/v1/auth/logout 返回 ok: true"
+      - "GET /api/v1/auth/me 带有效 JWT 返回用户信息 (含 permissions)"
+      - "无效 API Key 返回 401 + UNAUTHORIZED 错误码"
+      - "启动时 DEFAULT_API_KEYS 中的预置 key 可用"
+    acceptance_criteria:
+      - "4 个 auth API 端点 (login/refresh/logout/me) 全部实现并通过测试"
+      - "响应格式严格匹配 api-protocol.md §4.1"
+      - "JWT payload 包含 sub, org_id, role, permissions, jti, exp, type"
+      - "DEFAULT_API_KEYS 环境变量中的预置 key 启动时自动加载"
+      - "refresh_token 过期返回 details: {refresh_expired: true}"
+    failure_modes:
+      - scenario: "JWT 过期时间计算错误导致 token 立即失效"
+        likelihood: low
+        impact: medium
+        mitigation: "测试中验证 exp 大于当前时间"
+    tech_stack:
+      - "FastAPI"
+      - "PyJWT[crypto]"
+      - "httpx (测试用)"
+    test_coverage: "login 成功/失败, refresh 成功/过期, me 有效/无效 token"
+
+  - id: "ohent-2-host"
+    title: "实现 Host 宿主服务（API-to-SDK 映射 + OrchestratorClient 集成）"
+    description: |
+      TDD 实现 Host 服务，通过 API-to-SDK 映射层将外部 API 请求转换为 SDK 调用。
+      核心适配逻辑:
+      - 外部 API: POST /internal/agents {name, template_id?, agent_config_id?, model, config}
+      - SDK: InstanceCreateRequest {name, host, template_id, workspace_root, seed: {mode, template_dir}}
+      - 调用 ohent-0-shared-api-mapping 提供的映射函数完成转换
+      - workspace_root 自动生成 /tmp/ohent/{name}-{uuid}
+      - seed.template_dir 由 TEMPLATE_MAP 解析 (默认 /tmp/ohent-templates/default/)
+      
+      Host 服务配置:
+      - config.py 定义 TEMPLATES_DIR = "/tmp/ohent-templates"
+      - 启动时预创建 /tmp/ohent-templates/default/ 空目录
+      - OrchestratorClient 初始化: runtime="noop", allowed_roots=["/tmp/ohent"]
+      
+      内部 API (/internal/ 前缀，供 scheduler 调用):
+      1. GET /internal/agents: 列出所有实例 (list_instances)
+      2. POST /internal/agents: 创建实例 (映射 + create_instance)
+      3. GET /internal/agents/{instance_id}: 获取实例详情 (get_instance)
+      4. DELETE /internal/agents/{instance_id}: 销毁实例 (destroy_instance)
+      5. POST /internal/agents/{instance_id}/message: 发送消息 (send_message)
+      所有 SDK 调用包裹 try/except，将 SDK 异常转为 OHError（含 SEED_PATH_UNSAFE 映射为 403）。
+      TDD: 先写 tests/test_host_api.py，mock SDK 验证路由逻辑；再写 tests/test_host_sdk.py，真实 noop driver 验证集成。
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-env-sdk-verify", "ohent-0-shared", "ohent-0-shared-api-mapping"]
+    context_files:
+      - path: "docs/plan/openharness-sdk-research/research_findings_sdk_contract.md"
+        description: "SDK 契约研究，含 InstanceCreateRequest 和 SeedConfig 格式"
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议，定义外部 POST /api/v1/agents 请求体格式"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "增加 API-to-SDK 映射层集成；明确适配逻辑；增加模板目录预创建；SEED_PATH_UNSAFE 错误映射"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: null
+    verification:
+      - "pytest tests/test_host_sdk.py: noop driver 创建实例成功"
+      - "pytest tests/test_host_api.py: API 路由正确映射到 SDK 调用"
+      - "POST /internal/agents 接受外部 API 格式，内部正确转换为 InstanceCreateRequest"
+      - "workspace_root 自动生成 /tmp/ohent/{name}-{uuid} 格式"
+      - "模板目录不存在时启动时自动创建"
+      - "SDK SEED_PATH_UNSAFE 异常映射为 403 错误"
+      - "SDK 异常时返回正确错误码"
+    acceptance_criteria:
+      - "5 个内部 API 全部实现并通过测试"
+      - "API-to-SDK 映射逻辑正确（外部格式 → InstanceCreateRequest）"
+      - "模板目录 /tmp/ohent-templates/default/ 启动时预创建"
+      - "allowed_roots 配置为 ['/tmp/ohent']"
+      - "SDK 异常正确映射为 HTTP 错误响应"
+      - "InstanceRecord 字段完整返回"
+    failure_modes:
+      - scenario: "SDK InstanceCreateRequest 参数验证导致 422"
+        likelihood: medium
+        impact: medium
+        mitigation: "Host service 层做参数预处理，映射层确保 required 字段有合理默认值"
+      - scenario: "模板目录 /tmp/ohent-templates/default/ 创建失败（权限不足）"
+        likelihood: low
+        impact: medium
+        mitigation: "启动时检测目录是否存在，不存在则 os.makedirs 创建，失败时日志告警但服务继续"
+    tech_stack:
+      - "FastAPI"
+      - "openharness-sdk"
+      - "httpx (测试用)"
+      - "pytest"
+      - "pytest-asyncio"
+    test_coverage: "CRUD 全流程 + API-to-SDK 映射 + send_message + SDK 异常处理 + SEED_PATH_UNSAFE 映射"
+
+  - id: "ohent-2-scheduler"
+    title: "实现 Scheduler 调度服务（星型路由转发中心）"
+    description: |
+      TDD 实现 Scheduler 服务的路由转发功能。
+      Scheduler 是星型拓扑的中心节点，Gateway 将所有非 auth 请求转发到 Scheduler，Scheduler 再分发到各后端服务。
+      骨架阶段路由:
+      1. /api/v1/agents/* → 转发到 host 服务 (http://localhost:8002/internal/agents/*)
+      2. /api/v1/tasks/{task_id} → 骨架返回模拟任务状态 {data: {task_id, status: "completed"}}
+      转发逻辑:
+      - 使用 ohent_shared.ServiceClient 调用后端
+      - 保留原始 query params 和 request body
+      - 透传 X-Request-ID, X-User-ID, X-Tenant-ID, X-Org-ID 头
+      - 后端错误直接透传（502 包装为 UPSTREAM_UNAVAILABLE）
+      TDD: 先写 tests/test_scheduler_proxy.py（mock 后端服务），再实现路由。
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-0-shared"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "需求文档，含 Scheduler 作为星型中心的设计"
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含路由映射表 §3.1"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "明确星型拓扑中心角色；增加 X-Org-ID 头透传"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 2
+    estimated_lines: 200
+    focus_area: null
+    verification:
+      - "pytest tests/test_scheduler_proxy.py 全部 PASS"
+      - "GET /api/v1/agents 正确转发到 host 并返回数据"
+      - "POST /api/v1/agents 正确转发并返回创建结果"
+      - "后端不可用时返回 502 + UPSTREAM_UNAVAILABLE"
+      - "GET /api/v1/tasks/{id} 返回模拟状态"
+      - "X-Org-ID 头正确透传到后端"
+    acceptance_criteria:
+      - "agents 路由正确转发到 host 服务"
+      - "请求头透传正确（含 X-Org-ID）"
+      - "错误透传正确"
+      - "tasks 端点返回骨架模拟数据"
+    failure_modes:
+      - scenario: "转发路径映射错误导致 404"
+        likelihood: medium
+        impact: medium
+        mitigation: "测试覆盖所有路由映射；日志记录转发目标 URL"
+    tech_stack:
+      - "FastAPI"
+      - "httpx"
+      - "ohent_shared"
+    test_coverage: "路由转发(agents CRUD) + 错误透传 + 头透传(X-Org-ID) + tasks 模拟"
+
+  - id: "ohent-2-gateway"
+    title: "实现 Gateway 网关（JWT 中间件 + 星型路由转发）"
+    description: |
+      TDD 实现 Gateway 网关服务的核心功能。
+      功能:
+      1. JWT 认证中间件:
+         - 除 /health 和 /api/v1/auth/login 外，所有请求必须携带有效 JWT
+         - 从 Authorization: Bearer <token> 提取 JWT
+         - 使用 ohent_shared.security.decode_token 验证
+         - JWT 过期返回 401 + UNAUTHORIZED + details: {expired: true}
+         - 解析后注入 X-User-ID, X-Org-ID, X-Request-ID 头
+      2. 星型路由转发:
+         - /api/v1/auth/* → http://localhost:8001 (auth 服务, 直连)
+         - /api/v1/* → http://localhost:8003 (scheduler 服务, 星型拓扑中心)
+         - /health → 直接返回 {status: 'ok'}
+      3. 统一错误处理:
+         - JWT 无效/过期 → 401 + UNAUTHORIZED (过期时含 details: {expired: true})
+         - 下游不可用 → 502 + UPSTREAM_UNAVAILABLE
+      4. request_id 中间件: 每个请求生成 UUID request_id
+      TDD: 先写 tests/test_gateway.py（mock 后端），再实现中间件和转发。
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-0-shared"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "需求文档，含网关设计要求"
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含路由映射和认证规范"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "明确星型拓扑：非 auth 请求统一转发到 scheduler；JWT 过期返回 details: {expired: true}"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: null
+    verification:
+      - "pytest tests/test_gateway.py 全部 PASS"
+      - "无 JWT 请求 /api/v1/agents 返回 401 + UNAUTHORIZED"
+      - "过期 JWT 请求返回 401 + UNAUTHORIZED + details: {expired: true}"
+      - "有效 JWT 请求正确转发到 scheduler 并返回后端响应"
+      - "/api/v1/auth/* 正确转发到 auth 服务"
+      - "/health 无需 JWT 即可访问"
+      - "每个响应包含 X-Request-ID 头"
+      - "错误响应格式匹配 api-protocol.md"
+    acceptance_criteria:
+      - "JWT 中间件正确验证和注入用户信息"
+      - "星型拓扑：非 auth 请求全部转发到 scheduler，auth 请求直连 auth 服务"
+      - "JWT 过期返回 details: {expired: true}"
+      - "request_id 自动生成并透传"
+      - "错误响应格式统一"
+    failure_modes:
+      - scenario: "JWT 中间件误拦截 auth/login 请求"
+        likelihood: low
+        impact: high
+        mitigation: "白名单路径明确列出；测试覆盖白名单路径"
+    tech_stack:
+      - "FastAPI"
+      - "httpx"
+      - "PyJWT[crypto]"
+      - "ohent_shared"
+    test_coverage: "JWT 验证(有效/无效/过期), 路由转发, 白名单, 错误处理, request_id"
+
+  # ──────────────────── Phase 3: 全链路集成 ────────────────────
+  - id: "ohent-3-dev-startup"
+    title: "完善 PowerShell 开发环境一键启动脚本"
+    description: |
+      编写 scripts/dev_start.ps1，支持一键启动所有服务。
+      功能:
+      - 按顺序启动: gateway(8000), auth(8001), host(8002), scheduler(8003), memory(8004), market(8005), billing(8006)
+      - 每个服务在独立 PowerShell 进程中运行
+      - 启动后等待 health check 通过
+      - 打印服务启动状态表
+      - 支持 Ctrl+C 优雅关闭所有服务
+      - 可选参数: --skip-containers (跳过 Podman 容器启动)
+    wave: 4
+    agent: gem-devops
+    prototype: false
+    priority: medium
+    status: pending
+    dependencies: ["ohent-2-gateway", "ohent-2-auth", "ohent-2-host", "ohent-2-scheduler"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "需求文档，含 supervisor/进程管理决策"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 100
+    focus_area: null
+    verification:
+      - "运行 dev_start.ps1 后 7 个服务全部启动"
+      - "每个服务的 GET /health 返回 200"
+      - "Ctrl+C 后所有进程正常退出"
+    acceptance_criteria:
+      - "一键启动所有 7 个服务"
+      - "健康检查确认全部就绪"
+      - "支持优雅关闭"
+    failure_modes:
+      - scenario: "PowerShell 进程管理复杂度高，启动顺序依赖问题"
+        likelihood: medium
+        impact: medium
+        mitigation: "串行启动 + 每个 health check 超时 30s 后报错"
+    environment: development
+    requires_approval: false
+    devops_security_sensitive: false
+
+  - id: "ohent-3-e2e-full-chain"
+    title: "编写全链路 E2E 测试（curl 验证脚本）"
+    description: |
+      编写 tests/e2e_full_chain.py，验证完整请求链路。
+      测试场景:
+      1. login: POST /api/v1/auth/login (API Key) → 获取 JWT
+      2. me: GET /api/v1/auth/me (带 JWT) → 返回用户信息 (含 permissions)
+      3. logout: POST /api/v1/auth/logout (带 JWT) → 返回 ok
+      4. agents list: GET /api/v1/agents (带 JWT) → 返回空列表
+      5. create agent: POST /api/v1/agents (带 JWT, body={name, template_id, ...}) → 返回实例 (status: ready)
+      6. get agent: GET /api/v1/agents/{id} (带 JWT) → 返回实例详情
+      7. message agent: POST /api/v1/agents/{id}/message (带 JWT) → 返回消息结果
+      8. delete agent: DELETE /api/v1/agents/{id} (带 JWT) → 返回 ok
+      9. verify deleted: GET /api/v1/agents → 列表为空
+      额外验证:
+      - 无 JWT 请求返回 401 + UNAUTHORIZED
+      - 过期 JWT 请求返回 401 + UNAUTHORIZED + details: {expired: true}
+      - refresh_token 过期返回 details: {refresh_expired: true}
+      - 错误响应格式包含 code/message/request_id
+      - 每个请求的 request_id 唯一
+      - JWT payload 包含 permissions 字段
+      使用 httpx.AsyncClient 编写异步 E2E 测试， pytest-asyncio。
+    wave: 4
+    agent: gem-implementer
+    prototype: false
+    priority: high
+    status: pending
+    dependencies: ["ohent-3-dev-startup"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，验证响应格式"
+      - path: "docs/PRD.yaml"
+        description: "PRD 中的 acceptance_criteria: 骨架全链路跑通"
+    diagnosis: null
+    planning_pass: 2
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+      - pass: 2
+        reason: "增加 logout 测试；增加过期 token 场景（JWT 过期 + refresh 过期）；验证 permissions 字段"
+        timestamp: "2026-04-16T12:00:00Z"
+    estimated_effort: medium
+    estimated_files: 1
+    estimated_lines: 250
+    focus_area: null
+    verification:
+      - "pytest tests/e2e_full_chain.py 全部 PASS"
+      - "9 步全链路无报错（含 logout）"
+      - "过期 JWT 返回 details: {expired: true}"
+      - "过期 refresh_token 返回 details: {refresh_expired: true}"
+      - "响应格式对齐 api-protocol.md"
+    acceptance_criteria:
+      - "全链路 E2E 测试通过: login → me → logout → agents CRUD → message → delete"
+      - "401 未认证测试通过"
+      - "过期 JWT 测试通过（含 expired + refresh_expired 场景）"
+      - "响应格式验证通过"
+      - "满足 PRD acceptance_criteria: 骨架全链路跑通"
+    failure_modes:
+      - scenario: "E2E 测试依赖所有服务同时运行，CI 环境难以复现"
+        likelihood: medium
+        impact: medium
+        mitigation: "E2E 测试标记为 @pytest.mark.e2e；提供 fixture 自动启动/停止服务"
+    tech_stack:
+      - "httpx"
+      - "pytest"
+      - "pytest-asyncio"
+    test_coverage: "完整 9 步链路 + 过期 token 场景 + 错误场景 + 响应格式"
+
+  - id: "ohent-3-curl-script"
+    title: "编写 curl 全链路验证脚本"
+    description: |
+      编写 scripts/verify_full_chain.ps1，使用 curl 命令手动验证全链路。
+      功能:
+      - 定义测试 API Key
+      - Step 1: curl POST /api/v1/auth/login → 提取 JWT token
+      - Step 2: curl GET /api/v1/auth/me (带 JWT)
+      - Step 3: curl GET /api/v1/agents (带 JWT)
+      - Step 4: curl POST /api/v1/agents (带 JWT, JSON body)
+      - Step 5: curl GET /api/v1/agents/{id}
+      - Step 6: curl DELETE /api/v1/agents/{id}
+      - 每步打印请求和响应，最终打印 PASS/FAIL 摘要
+      - 彩色输出，方便在终端查看
+    wave: 4
+    agent: gem-devops
+    prototype: false
+    priority: medium
+    status: pending
+    dependencies: ["ohent-3-dev-startup"]
+    context_files:
+      - path: "docs/PRD.yaml"
+        description: "PRD 中 acceptance_criteria 要求 curl 验证"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 120
+    focus_area: null
+    verification:
+      - "运行 verify_full_chain.ps1，所有步骤 PASS"
+    acceptance_criteria:
+      - "curl 脚本覆盖全链路 6 步"
+      - "每步有 PASS/FAIL 判断"
+      - "输出可读性好"
+    failure_modes: []
+    environment: development
+    requires_approval: false
+    devops_security_sensitive: false
+
+  # ──────────────────── Phase 4: 模块化填充 + 集成测试 ────────────────────
+  - id: "ohent-4-memory-skeleton"
+    title: "填充 Memory 记忆服务骨架 API"
+    description: |
+      TDD 实现 Memory 服务的最小 API 集合。
+      功能:
+      1. GET /api/v1/memory/tree?path=org-001/ → 返回路径树
+      2. POST /api/v1/memory/assets → 上传资产 (body: {path, content, content_type})
+      3. GET /api/v1/memory/assets?path=org-001/skills/ → 查询资产
+      4. DELETE /api/v1/memory/assets?path=org-001/skills/old → 删除资产
+      骨架阶段: 使用 PostgreSQL + SQLAlchemy async 实现简单 KV 存储
+      ORM 模型: Asset(path TEXT PK, content TEXT, content_type TEXT, created_at, updated_at)
+      包含 Alembic 迁移脚本。
+      TDD: 先写测试，再实现。
+    wave: 5
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: pending
+    dependencies: ["ohent-3-e2e-full-chain", "ohent-env-podman"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/require.md"
+        description: "需求文档，含记忆服务设计"
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含记忆资产接口"
+      - path: "docs/plan/research_backend_tech_stack.md"
+        description: "技术选型，含 SQLAlchemy async + Alembic 方案"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 280
+    focus_area: null
+    verification:
+      - "pytest tests/ 全部 PASS"
+      - "Alembic migration 成功创建 assets 表"
+      - "CRUD 四个端点正常工作"
+    acceptance_criteria:
+      - "4 个 memory API 端点实现并通过测试"
+      - "ORM 模型和 Alembic 迁移就绪"
+      - "使用 SQLAlchemy async session"
+    failure_modes:
+      - scenario: "asyncpg 连接 PostgreSQL 失败"
+        likelihood: low
+        impact: medium
+        mitigation: "Phase 0 已验证数据库连接；测试使用独立 test database"
+    tech_stack:
+      - "FastAPI"
+      - "SQLAlchemy[asyncio]"
+      - "asyncpg"
+      - "Alembic"
+    test_coverage: "CRUD 全流程 + 分页 + 路径查询"
+
+  - id: "ohent-4-market-skeleton"
+    title: "填充 Market 市场服务骨架 API"
+    description: |
+      TDD 实现 Market 服务的最小 API 集合。
+      功能:
+      1. GET /api/v1/market/templates?category=&keyword=&page=&page_size → 模板列表
+      2. GET /api/v1/market/templates/{id} → 模板详情
+      3. GET /api/v1/market/skills → Skill 列表
+      4. GET /api/v1/market/mcps → MCP 列表
+      骨架阶段: 内存存储 + 种子数据 (3 个模板, 2 个 skill, 1 个 mcp)
+      ORM 模型 (PostgreSQL): Template(id, name, description, category, skills JSONB), Skill(id, name, description), McpServer(id, name, transport, description)
+      TDD: 先写测试，再实现。
+    wave: 5
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: pending
+    dependencies: ["ohent-3-e2e-full-chain", "ohent-env-podman"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含市场接口定义"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 2
+    estimated_lines: 200
+    focus_area: null
+    verification:
+      - "pytest tests/ 全部 PASS"
+      - "模板列表支持分页和分类过滤"
+      - "模板详情返回完整数据"
+    acceptance_criteria:
+      - "4 个 market API 端点实现并通过测试"
+      - "种子数据可查询"
+      - "分页功能正常"
+    failure_modes: []
+    tech_stack:
+      - "FastAPI"
+      - "SQLAlchemy[asyncio]"
+    test_coverage: "模板列表/详情 + Skill/MCP 列表 + 分页 + 过滤"
+
+  - id: "ohent-4-billing-skeleton"
+    title: "填充 Billing 计费服务骨架 API"
+    description: |
+      TDD 实现 Billing 服务的最小 API 集合。
+      功能:
+      1. GET /api/v1/billing/summary?period=month → 费用概览
+      2. GET /api/v1/billing/records?page=&page_size&instance_id=&start_date=&end_date → 账单明细
+      骨架阶段: 内存存储 + 种子数据 (3 条账单记录)
+      ORM 模型: UsageRecord(id, instance_id, model, input_tokens, output_tokens, cost, created_at)
+      TDD: 先写测试，再实现。
+    wave: 5
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: pending
+    dependencies: ["ohent-3-e2e-full-chain", "ohent-env-podman"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含计费接口定义"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 150
+    focus_area: null
+    verification:
+      - "pytest tests/ 全部 PASS"
+      - "费用概览返回正确聚合数据"
+      - "账单明细支持分页和过滤"
+    acceptance_criteria:
+      - "2 个 billing API 端点实现并通过测试"
+      - "种子数据可查询"
+      - "分页和日期过滤正常"
+    failure_modes: []
+    tech_stack:
+      - "FastAPI"
+      - "SQLAlchemy[asyncio]"
+    test_coverage: "费用概览 + 账单明细 + 分页 + 过滤"
+
+  - id: "ohent-4-scheduler-expand"
+    title: "扩展 Scheduler 路由（添加 memory/market/billing 转发）"
+    description: |
+      在 Scheduler 中添加 memory/market/billing 服务的路由转发。
+      新增路由:
+      1. /api/v1/memory/* → http://localhost:8004
+      2. /api/v1/market/* → http://localhost:8005
+      3. /api/v1/billing/* → http://localhost:8006
+      TDD: 为每条新路由写转发测试。
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: completed
+    dependencies: ["ohent-4-memory-skeleton", "ohent-4-market-skeleton", "ohent-4-billing-skeleton"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含路由映射表"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 100
+    focus_area: null
+    verification:
+      - "pytest tests/ 新增路由转发测试 PASS"
+      - "GET /api/v1/market/templates 通过网关→调度→市场 返回数据"
+    acceptance_criteria:
+      - "3 条新路由转发正确"
+      - "已有 agents 路由不受影响"
+    failure_modes: []
+    tech_stack:
+      - "FastAPI"
+      - "httpx"
+    test_coverage: "memory/market/billing 各 1 个转发测试"
+
+  - id: "ohent-4-integration-test"
+    title: "编写跨服务集成测试"
+    description: |
+      编写 tests/test_integration.py，验证多服务协同。
+      测试场景:
+      1. 全链路 agents CRUD (已由 e2e 覆盖，此处确认仍通过)
+      2. 通过网关访问 market: GET /api/v1/market/templates → 返回模板列表
+      3. 通过网关访问 billing: GET /api/v1/billing/summary → 返回费用数据
+      4. 错误场景: 无效 instance_id 返回 404 + NOT_FOUND
+      5. request_id 全链路追踪: 同一请求的 request_id 在网关日志和响应中一致
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: completed
+    dependencies: ["ohent-4-scheduler-expand", "ohent-3-e2e-full-chain"]
+    context_files:
+      - path: "docs/PRD.yaml"
+        description: "PRD acceptance_criteria: 所有测试通过"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 1
+    estimated_lines: 150
+    focus_area: null
+    verification:
+      - "pytest tests/test_integration.py 全部 PASS"
+      - "跨服务路由全部可达"
+    acceptance_criteria:
+      - "集成测试覆盖 3 个新服务的路由"
+      - "错误场景覆盖 404"
+      - "request_id 一致性验证"
+    failure_modes: []
+    tech_stack:
+      - "httpx"
+      - "pytest"
+      - "pytest-asyncio"
+    test_coverage: "跨服务路由 + 错误处理 + request_id 追踪"
+
+  - id: "ohent-4-gateway-route-expand"
+    title: "扩展 Gateway 路由（添加 memory/market/billing）"
+    description: |
+      在 Gateway 路由表中添加 memory/market/billing 的转发规则。
+      新增:
+      - /api/v1/memory/* → scheduler (→ memory 服务)
+      - /api/v1/market/* → scheduler (→ market 服务)
+      - /api/v1/billing/* → scheduler (→ billing 服务)
+      所有新路由需要 JWT 认证。
+      TDD: 测试新路由的 JWT 验证和转发。
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    priority: medium
+    status: completed
+    dependencies: ["ohent-4-scheduler-expand"]
+    context_files:
+      - path: "OpenHarnessEnterprise/docs/api-protocol.md"
+        description: "API 协议文档，含网关路由映射表"
+    diagnosis: null
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial plan"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 80
+    focus_area: null
+    verification:
+      - "GET /api/v1/market/templates (带 JWT) 返回 200"
+      - "GET /api/v1/market/templates (无 JWT) 返回 401"
+    acceptance_criteria:
+      - "3 条新路由在网关层正确配置"
+      - "JWT 中间件对新路由生效"
+    failure_modes: []
+    tech_stack:
+      - "FastAPI"
+      - "httpx"
+    test_coverage: "新路由 JWT 验证 + 转发"
+
+planning_pass: 1
+planning_history:
+  - pass: 1
+    reason: "initial plan creation"
+    timestamp: "2026-04-16T00:00:00Z"

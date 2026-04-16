@@ -1,0 +1,111 @@
+prd_id: OHE-001
+version: 0.1.0
+
+user_stories:
+  - as_a: "Enterprise Admin"
+    i_want: "通过 SDK 创建和管理 Harness Agent 实例"
+    so_that: "企业内部可以申领、监控和计费 Agent 消耗"
+  - as_a: "Developer"
+    i_want: "先跑通骨架服务链路（Gateway → Scheduler → Host → SDK）"
+    so_that: "后续模块化开发有稳定的基线可回归"
+  - as_a: "Developer"
+    i_want: "TDD 模式开发，每步有测试验证"
+    so_that: "保证实现质量，防止回归"
+
+scope:
+  in_scope:
+    - "Phase 0: 环境准备（Python 3.11+, PostgreSQL, Redis, Podman, SDK安装）"
+    - "Phase 1: 骨架搭建（6个微服务骨架 + Gateway + shared库）"
+    - "Phase 2: 全链路跑通（Gateway → Auth → Scheduler → Host → SDK 实例创建）"
+    - "Phase 3: 模块化实现（Auth, Org/Permission, Memory, Market, Billing, Scheduler 逐个完善）"
+    - "Phase 4: 集成测试与 E2E 验证"
+    - "服务间 HTTP 通信 + JWT 认证"
+    - "统一错误码与响应格式（对齐 api-protocol.md）"
+    - "TDD: 每个模块先写测试再写实现"
+  out_of_scope:
+    - "前端实现（React + Ant Design，后续单独规划）"
+    - "WebSocket 流式通道（预留接口，首期不实现）"
+    - "gRPC 通道（首期全部用 HTTP）"
+    - "Kubernetes 生产部署"
+    - "Celery 异步任务队列（骨架阶段用同步模拟）"
+    - "限流熔断（骨架阶段跳过）"
+
+acceptance_criteria:
+  - criterion: "骨架全链路跑通"
+    verification: "curl 调用 Gateway API → JWT 认证 → 创建 Agent 实例（noop模式）→ 返回实例记录"
+  - criterion: "SDK 集成验证"
+    verification: "Host 服务通过 OrchestratorClient 成功创建 noop 实例"
+  - criterion: "所有测试通过"
+    verification: "pytest 全部 pass，覆盖率 ≥ 80%"
+  - criterion: "协议对齐"
+    verification: "API 响应格式严格匹配 api-protocol.md 定义的统一响应格式和错误码"
+
+decisions:
+  - id: ADR-001
+    status: accepted
+    decision: "单机多进程开发模式，使用 supervisor 管理服务进程"
+    rationale: "本地开发简单，服务间用 HTTP 通信，无需 Docker Compose 额外复杂度"
+    alternatives: ["Docker Compose", "混合模式"]
+    consequences: ["需要安装 supervisor", "进程管理配置需维护"]
+  - id: ADR-002
+    status: accepted
+    decision: "骨架阶段直接使用 PostgreSQL + Redis"
+    rationale: "避免后续迁移成本，本地用 Podman 跑数据库容器"
+    alternatives: ["SQLite + 内存缓存"]
+    consequences: ["需要本地 Podman 环境", "SQLAlchemy async 引擎"]
+  - id: ADR-003
+    status: accepted
+    decision: "骨架阶段跑通全链路 Gateway → Auth → Scheduler → Host → SDK"
+    rationale: "验证所有服务通信基线，后续模块填充有稳定回归基础"
+    alternatives: ["核心子集", "最小可行"]
+    consequences: ["骨架阶段工作量稍大但后续更稳"]
+  - id: ADR-004
+    status: accepted
+    decision: "容器运行时使用 Podman，骨架阶段 SDK 用 noop driver 跑通逻辑"
+    rationale: "本地已有 Podman，noop driver 无需真实容器即可验证服务链路"
+    alternatives: ["直接用 Podman driver", "Docker driver"]
+    consequences: ["后期需要切换到 Podman driver 进行真实容器测试"]
+  - id: ADR-005
+    status: accepted
+    decision: "包管理使用 pip + venv"
+    rationale: "用户当前环境使用 pip"
+    alternatives: ["uv", "pdm"]
+    consequences: ["依赖解析可能比 uv 慢"]
+
+features:
+  - name: "shared 公共库"
+    overview: "所有服务共享的 Pydantic 模型、错误码、工具函数、配置基类"
+    status: planned
+  - name: "gateway 网关服务"
+    overview: "FastAPI 网关，路由转发、JWT 认证中间件、统一错误处理"
+    status: planned
+  - name: "auth 认证服务"
+    overview: "API Key 登录、JWT 签发/刷新/撤销"
+    status: planned
+  - name: "host 宿主服务"
+    overview: "通过 SDK 的 OrchestratorClient 创建和管理 Agent 实例"
+    status: planned
+  - name: "scheduler 中央调度服务"
+    overview: "服务注册发现、任务编排、实例生命周期管理（骨架简化版）"
+    status: planned
+  - name: "memory 记忆服务"
+    overview: "路径式资产存储 CRUD"
+    status: planned
+  - name: "market 市场服务"
+    overview: "模板、Skill、MCP 浏览"
+    status: planned
+  - name: "billing 计费服务"
+    overview: "Token 消耗统计与费用查询"
+    status: planned
+
+task_clarifications:
+  - question: "开发环境"
+    answer: "单机多进程 (supervisor)"
+  - question: "数据库优先级"
+    answer: "全量安装 PostgreSQL + Redis"
+  - question: "骨架范围"
+    answer: "全链路 Gateway → Auth → Scheduler → Host → SDK"
+  - question: "容器运行时"
+    answer: "有 Podman，骨架用 noop driver"
+  - question: "Python 环境"
+    answer: "Python 3.11+ pip + venv"

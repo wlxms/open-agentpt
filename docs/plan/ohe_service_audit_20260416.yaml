@@ -1,0 +1,1058 @@
+# OpenHarness Enterprise - 微服务实现状态全面审计报告
+
+plan_id: ohe-service-audit
+objective: 评估 OHE 8 个服务模块的当前实现状态、骨架完整度、缺失功能与测试覆盖缺口
+focus_area: all-services
+created_at: "2026-04-16"
+created_by: gem-researcher
+status: completed
+
+tldr: |
+  - 8 个服务模块共 62 个 .py 文件，服务端约 1044 行有效代码，测试端约 1654 行
+  - 所有服务均为 skeleton 阶段：内存 dict 存储（无 PostgreSQL/Redis 实际连接），种子数据硬编码
+  - API 协议定义 ~80+ 个端点，当前仅实现约 25 个（31%），大量端点完全缺失
+  - 123 个测试全部通过，但覆盖面窄：主要测 happy path，边界/错误/并发测试几乎为零
+  - 生产化缺口巨大：无真实 DB/Redis、无 Celery、无 WebSocket、无组织权限、无审批、无 Builder 模块
+  - shared 库基础设施完善（JWT/错误码/响应格式/SQLAlchemy/Redis/ServiceClient），可直接用于生产填充
+
+research_metadata:
+  methodology: "逐文件读取全部 62 个服务 .py + 19 个测试 .py，交叉对比 api-protocol.md 端点定义与实际实现"
+  scope: "全覆盖：8 个服务目录 + shared 库 + docs + tests"
+  confidence: high
+  coverage: 100
+  decision_blockers: 0
+  research_blockers: 0
+
+# ==================================================================
+# 一、各服务详细审计
+# ==================================================================
+
+files_analyzed:
+  # ---------- shared ----------
+  - file: shared/src/ohent_shared/__init__.py
+    path: services/shared/src/ohent_shared/__init__.py
+    purpose: 公共库导出入口
+    key_elements:
+      - element: __all__ 导出列表
+        type: variable
+        location: services/shared/src/ohent_shared/__init__.py:1
+        description: 导出全部共享符号
+    language: python
+    lines: 29
+  - file: shared/src/ohent_shared/config.py
+    path: services/shared/src/ohent_shared/config.py
+    purpose: 端口/URL/数据库/Redis/JWT 配置
+    key_elements:
+      - element: GATEWAY_PORT..BILLING_PORT
+        type: variable
+        location: services/shared/src/ohent_shared/config.py:6-12
+        description: 7 个服务端口常量
+      - element: AUTH_URL..BILLING_URL
+        type: variable
+        location: services/shared/src/ohent_shared/config.py:15-20
+        description: 6 个服务 URL（localhost）
+      - element: DatabaseSettings
+        type: class
+        location: services/shared/src/ohent_shared/config.py:24-28
+        description: PostgreSQL asyncpg 连接配置
+      - element: RedisSettings
+        type: class
+        location: services/shared/src/ohent_shared/config.py:31-33
+        description: Redis 连接配置
+      - element: JWTSettings
+        type: class
+        location: services/shared/src/ohent_shared/config.py:36-42
+        description: JWT 密钥/算法/过期时间
+    language: python
+    lines: 38
+  - file: shared/src/ohent_shared/db.py
+    path: services/shared/src/ohent_shared/db.py
+    purpose: SQLAlchemy async engine/session 工厂
+    key_elements:
+      - element: engine
+        type: variable
+        location: services/shared/src/ohent_shared/db.py:9
+        description: create_async_engine，连接 PostgreSQL
+      - element: async_session_factory
+        type: variable
+        location: services/shared/src/ohent_shared/db.py:10
+        description: async_sessionmaker
+      - element: Base
+        type: class
+        location: services/shared/src/ohent_shared/db.py:13-14
+        description: DeclarativeBase
+      - element: get_db
+        type: function
+        location: services/shared/src/ohent_shared/db.py:17-19
+        description: async generator 依赖注入
+    language: python
+    lines: 12
+  - file: shared/src/ohent_shared/redis.py
+    path: services/shared/src/ohent_shared/redis.py
+    purpose: Redis 连接工厂（全局单例）
+    key_elements:
+      - element: get_redis / close_redis
+        type: function
+        location: services/shared/src/ohent_shared/redis.py:12-19
+        description: 懒加载 Redis 客户端
+    language: python
+    lines: 15
+  - file: shared/src/ohent_shared/errors.py
+    path: services/shared/src/ohent_shared/errors.py
+    purpose: 错误码定义、状态映射、OHError/error_response
+    key_elements:
+      - element: ErrorCode
+        type: class
+        location: services/shared/src/ohent_shared/errors.py:8-20
+        description: 11 个错误码常量（UNAUTHORIZED..SERVICE_UNAVAILABLE）
+      - element: ErrorStatusMap
+        type: class
+        location: services/shared/src/ohent_shared/errors.py:23-35
+        description: 错误码到 HTTP 状态码映射
+      - element: OHError / error_response
+        type: function
+        location: services/shared/src/ohent_shared/errors.py:38-55
+        description: 生成错误响应字典
+    language: python
+    lines: 48
+  - file: shared/src/ohent_shared/responses.py
+    path: services/shared/src/ohent_shared/responses.py
+    purpose: 统一响应包装器
+    key_elements:
+      - element: ok_response / data_response / list_response
+        type: function
+        location: services/shared/src/ohent_shared/responses.py:7-20
+        description: API 协议 §2.1 的三种成功响应格式
+    language: python
+    lines: 17
+  - file: shared/src/ohent_shared/schemas.py
+    path: services/shared/src/ohent_shared/schemas.py
+    purpose: 通用 Pydantic 模型
+    key_elements:
+      - element: RequestContext / PaginatedQuery / UserInfo
+        type: class
+        location: services/shared/src/ohent_shared/schemas.py:5-16
+        description: 请求上下文、分页参数、用户信息
+    language: python
+    lines: 17
+  - file: shared/src/ohent_shared/security.py
+    path: services/shared/src/ohent_shared/security.py
+    purpose: JWT 创建与解码
+    key_elements:
+      - element: create_access_token / create_refresh_token / decode_token
+        type: function
+        location: services/shared/src/ohent_shared/security.py:8-27
+        description: PyJWT 封装，支持 jti/exp/type 字段
+    language: python
+    lines: 29
+  - file: shared/src/ohent_shared/service_client.py
+    path: services/shared/src/ohent_shared/service_client.py
+    purpose: 服务间 HTTP 调用客户端
+    key_elements:
+      - element: ServiceClient.call
+        type: function
+        location: services/shared/src/ohent_shared/service_client.py:11-27
+        description: httpx async 客户端，注入 X-Internal-Call/X-Request-ID 头
+    language: python
+    lines: 27
+  - file: shared/src/ohent_shared/api_mapping.py
+    path: services/shared/src/ohent_shared/api_mapping.py
+    purpose: API→SDK 请求映射层
+    key_elements:
+      - element: CreateAgentRequest / AgentMappingSettings / InstanceMapper
+        type: class
+        location: services/shared/src/ohent_shared/api_mapping.py:9-57
+        description: 将外部 API 格式转换为 SDK InstanceCreateRequest
+    language: python
+    lines: 57
+
+  # ---------- gateway ----------
+  - file: gateway/src/ohent_gateway/main.py
+    path: services/gateway/src/ohent_gateway/main.py
+    purpose: 网关 FastAPI 应用入口
+    key_elements:
+      - element: app
+        type: variable
+        location: services/gateway/src/ohent_gateway/main.py:11-14
+        description: FastAPI app，注册 GatewayMiddleware
+      - element: /health
+        type: function
+        location: services/gateway/src/ohent_gateway/main.py:20-21
+        description: 健康检查
+    language: python
+    lines: 17
+  - file: gateway/src/ohent_gateway/middleware.py
+    path: services/gateway/src/ohent_gateway/middleware.py
+    purpose: JWT 认证中间件 + 请求转发到 Scheduler
+    key_elements:
+      - element: GatewayMiddleware.dispatch
+        type: function
+        location: services/gateway/src/ohent_gateway/middleware.py:20-82
+        description: 核心中间件：request_id 注入、PUBLIC_PATHS 免认证、JWT 验证、用户信息注入 state、转发到 Scheduler
+      - element: _forward_public
+        type: function
+        location: services/gateway/src/ohent_gateway/middleware.py:84-119
+        description: 免认证路径转发到 Scheduler
+      - element: _forward_to_scheduler
+        type: function
+        location: services/gateway/src/ohent_gateway/middleware.py:121-155
+        description: JWT 认证后转发到 Scheduler
+    language: python
+    lines: 155
+
+  # ---------- auth ----------
+  - file: auth/src/ohent_auth/main.py
+    path: services/auth/src/ohent_auth/main.py
+    purpose: 认证服务入口
+    key_elements:
+      - element: lifespan
+        type: function
+        location: services/auth/src/ohent_auth/main.py:8-11
+        description: 初始化 API Keys
+      - element: /health
+        type: function
+        location: services/auth/src/ohent_auth/main.py:17-18
+        description: 健康检查
+    language: python
+    lines: 15
+  - file: auth/src/ohent_auth/service.py
+    path: services/auth/src/ohent_auth/service.py
+    purpose: 认证服务层
+    key_elements:
+      - element: _API_KEYS (全局 dict)
+        type: variable
+        location: services/auth/src/ohent_auth/service.py:7
+        description: "内存存储的 API Key 字典（3 个种子 key）"
+      - element: init_api_keys / authenticate_api_key
+        type: function
+        location: services/auth/src/ohent_auth/service.py:9-18
+        description: 初始化/查询 API Key
+      - element: login / refresh / get_user_info
+        type: function
+        location: services/auth/src/ohent_auth/service.py:28-92
+        description: 登录（API Key→JWT）、Token 续期、获取用户信息
+    language: python
+    lines: 95
+  - file: auth/src/ohent_auth/api/v1/auth.py
+    path: services/auth/src/ohent_auth/api/v1/auth.py
+    purpose: 认证 API 路由
+    key_elements:
+      - element: POST /internal/auth/login
+        type: function
+        location: services/auth/src/ohent_auth/api/v1/auth.py:20-31
+        description: API Key 登录
+      - element: POST /internal/auth/refresh
+        type: function
+        location: services/auth/src/ohent_auth/api/v1/auth.py:34-44
+        description: Token 续期
+      - element: POST /internal/auth/logout
+        type: function
+        location: services/auth/src/ohent_auth/api/v1/auth.py:47-48
+        description: 登出（空实现）
+      - element: GET /internal/auth/me
+        type: function
+        location: services/auth/src/ohent_auth/api/v1/auth.py:51-71
+        description: 获取当前用户信息
+    language: python
+    lines: 51
+
+  # ---------- host ----------
+  - file: host/src/ohent_host/main.py
+    path: services/host/src/ohent_host/main.py
+    purpose: Agent 宿主服务入口
+    key_elements:
+      - element: DS_API_KEY 环境变量回退
+        type: pattern
+        location: services/host/src/ohent_host/main.py:6-7
+        description: 为 SDK send_message 设置 dummy API Key
+    language: python
+    lines: 17
+  - file: host/src/ohent_host/service.py
+    path: services/host/src/ohent_host/service.py
+    purpose: 宿主服务层（SDK 封装）
+    key_elements:
+      - element: HostService.__init__
+        type: function
+        location: services/host/src/ohent_host/service.py:4-15
+        description: 创建临时目录、InstanceMapper、OrchestratorClient（noop runtime）
+      - element: create_instance / list_instances / get_instance / destroy_instance / send_message
+        type: function
+        location: services/host/src/ohent_host/service.py:17-55
+        description: Agent CRUD + 消息发送（调用 SDK）
+    language: python
+    lines: 63
+  - file: host/src/ohent_host/api/v1/agents.py
+    path: services/host/src/ohent_host/api/v1/agents.py
+    purpose: Agent API 路由
+    key_elements:
+      - element: GET /internal/agents
+        type: function
+        location: services/host/src/ohent_host/api/v1/agents.py:17-19
+        description: 列出所有 Agent
+      - element: POST /internal/agents
+        type: function
+        location: services/host/src/ohent_host/api/v1/agents.py:22-26
+        description: 创建 Agent
+      - element: GET /internal/agents/{id}
+        type: function
+        location: services/host/src/ohent_host/api/v1/agents.py:29-34
+        description: 获取 Agent 详情
+      - element: DELETE /internal/agents/{id}
+        type: function
+        location: services/host/src/ohent_host/api/v1/agents.py:37-39
+        description: 销毁 Agent
+      - element: POST /internal/agents/{id}/message
+        type: function
+        location: services/host/src/ohent_host/api/v1/agents.py:42-45
+        description: 发送消息
+    language: python
+    lines: 41
+
+  # ---------- scheduler ----------
+  - file: scheduler/src/ohent_scheduler/main.py
+    path: services/scheduler/src/ohent_scheduler/main.py
+    purpose: 中央调度服务入口 + catch-all 路由
+    key_elements:
+      - element: GET /api/v1/tasks/{task_id}
+        type: function
+        location: services/scheduler/src/ohent_scheduler/main.py:23-26
+        description: 异步任务状态查询
+      - element: /api/v1/{path:path} catch-all
+        type: function
+        location: services/scheduler/src/ohent_scheduler/main.py:29-31
+        description: 所有 API v1 请求转发到 proxy
+      - element: internal/agents CRUD
+        type: function
+        location: services/scheduler/src/ohent_scheduler/main.py:34-50
+        description: 内部 Agent 路由转发到 host
+    language: python
+    lines: 42
+  - file: scheduler/src/ohent_scheduler/proxy.py
+    path: services/scheduler/src/ohent_scheduler/proxy.py
+    purpose: 服务代理 - 请求转发到后端服务
+    key_elements:
+      - element: ROUTE_TABLE
+        type: variable
+        location: services/scheduler/src/ohent_scheduler/proxy.py:6-12
+        description: "5 条路由规则：auth→auth, agents→host, memory→memory, market→market, billing→billing"
+      - element: proxy_request
+        type: function
+        location: services/scheduler/src/ohent_scheduler/proxy.py:18-76
+        description: 核心代理：路径匹配→URL 重写→header 注入→httpx 转发→错误处理
+      - element: _tasks (内存 dict)
+        type: variable
+        location: services/scheduler/src/ohent_scheduler/proxy.py:15
+        description: 内存任务存储
+      - element: get_task_status
+        type: function
+        location: services/scheduler/src/ohent_scheduler/proxy.py:79-83
+        description: 查询任务状态（未知任务返回 completed）
+    language: python
+    lines: 88
+
+  # ---------- memory ----------
+  - file: memory/src/ohent_memory/service.py
+    path: services/memory/src/ohent_memory/service.py
+    purpose: 记忆服务层（内存 KV 存储）
+    key_elements:
+      - element: _assets (内存 dict)
+        type: variable
+        location: services/memory/src/ohent_memory/service.py:7
+        description: "路径→资产内容的内存字典"
+      - element: create_asset / get_asset / list_assets / delete_asset
+        type: function
+        location: services/memory/src/ohent_memory/service.py:14-55
+        description: CRUD 操作
+      - element: _seed
+        type: function
+        location: services/memory/src/ohent_memory/service.py:60-64
+        description: 种子数据：3 个示例资产
+    language: python
+    lines: 65
+  - file: memory/src/ohent_memory/api/v1/assets.py
+    path: services/memory/src/ohent_memory/api/v1/assets.py
+    purpose: 资产 API 路由
+    key_elements:
+      - element: GET /internal/memory/assets
+        type: function
+        location: services/memory/src/ohent_memory/api/v1/assets.py:15-22
+        description: 列出资产（支持 path 前缀过滤）
+      - element: GET /internal/memory/assets/{path}
+        type: function
+        location: services/memory/src/ohent_memory/api/v1/assets.py:25-30
+        description: 获取资产内容
+      - element: POST /internal/memory/assets
+        type: function
+        location: services/memory/src/ohent_memory/api/v1/assets.py:33-35
+        description: 创建/更新资产
+      - element: DELETE /internal/memory/assets/{path}
+        type: function
+        location: services/memory/src/ohent_memory/api/v1/assets.py:38-42
+        description: 删除资产
+    language: python
+    lines: 41
+
+  # ---------- market ----------
+  - file: market/src/ohent_market/service.py
+    path: services/market/src/ohent_market/service.py
+    purpose: 市场服务层（内存列表存储）
+    key_elements:
+      - element: _templates / _skills / _mcps (内存 list)
+        type: variable
+        location: services/market/src/ohent_market/service.py:7-9
+        description: 内存中的模板/Skill/MCP 列表
+      - element: list_templates / get_template / list_skills / list_mcps
+        type: function
+        location: services/market/src/ohent_market/service.py:15-106
+        description: 列表（分页+筛选）和详情查询
+      - element: _seed
+        type: function
+        location: services/market/src/ohent_market/service.py:110-149
+        description: 种子数据：3 模板、2 Skill、1 MCP
+    language: python
+    lines: 150
+  - file: market/src/ohent_market/api/v1/templates.py
+    path: services/market/src/ohent_market/api/v1/templates.py
+    purpose: 市场 API 路由
+    key_elements:
+      - element: GET /internal/market/templates
+        type: function
+        location: services/market/src/ohent_market/api/v1/templates.py:22-31
+        description: 模板列表（category/keyword/page/page_size）
+      - element: GET /internal/market/templates/{id}
+        type: function
+        location: services/market/src/ohent_market/api/v1/templates.py:34-39
+        description: 模板详情
+      - element: GET /internal/market/skills
+        type: function
+        location: services/market/src/ohent_market/api/v1/templates.py:47-53
+        description: Skill 列表
+      - element: GET /internal/market/mcps
+        type: function
+        location: services/market/src/ohent_market/api/v1/templates.py:62-68
+        description: MCP 列表
+    language: python
+    lines: 57
+
+  # ---------- billing ----------
+  - file: billing/src/ohent_billing/service.py
+    path: services/billing/src/ohent_billing/service.py
+    purpose: 计费服务层（内存记录存储）
+    key_elements:
+      - element: _calc_cost
+        type: function
+        location: services/billing/src/ohent_billing/service.py:7-8
+        description: 固定费率：input $0.00001/token, output $0.00003/token
+      - element: SEED_RECORDS
+        type: variable
+        location: services/billing/src/ohent_billing/service.py:10-53
+        description: 5 条种子账单记录
+      - element: get_summary
+        type: function
+        location: services/billing/src/ohent_billing/service.py:65-95
+        description: 费用汇总（by_model + daily_trend）
+      - element: list_records
+        type: function
+        location: services/billing/src/ohent_billing/service.py:97-117
+        description: 账单明细（分页+筛选）
+    language: python
+    lines: 123
+  - file: billing/src/ohent_billing/api/v1/usage.py
+    path: services/billing/src/ohent_billing/api/v1/usage.py
+    purpose: 计费 API 路由
+    key_elements:
+      - element: GET /internal/billing/usage/summary
+        type: function
+        location: services/billing/src/ohent_billing/api/v1/usage.py:12-16
+        description: 费用概览
+      - element: GET /internal/billing/usage/records
+        type: function
+        location: services/billing/src/ohent_billing/api/v1/usage.py:19-31
+        description: 账单明细
+    language: python
+    lines: 35
+
+# ==================================================================
+# 二、API 端点实现对照表
+# ==================================================================
+
+patterns_found:
+  - category: architecture
+    pattern: 所有服务使用内存 dict/list 存储，无真实数据库
+    description: "每个服务的数据存储都是 Python 内存数据结构（dict/list），进程重启即丢失。shared/db.py 和 shared/redis.py 已准备好但未被任何服务使用。"
+    examples:
+      - file: services/auth/src/ohent_auth/service.py
+        location: services/auth/src/ohent_auth/service.py:7
+        snippet: '_API_KEYS: dict[str, dict] = {}'
+      - file: services/memory/src/ohent_memory/service.py
+        location: services/memory/src/ohent_memory/service.py:7
+        snippet: 'self._assets: dict[str, dict[str, Any]] = {}'
+      - file: services/billing/src/ohent_billing/service.py
+        location: services/billing/src/ohent_billing/service.py:61
+        snippet: 'self._records = [self._enrich(r) for r in (records or [])]'
+    prevalence: common
+
+  - category: architecture
+    pattern: 网关→调度→后端 三层代理架构
+    description: "Gateway 解析 JWT 后转发到 Scheduler，Scheduler 根据 ROUTE_TABLE 转发到后端服务。所有代理使用 httpx.AsyncClient，每次请求创建新连接（无连接池）。"
+    examples:
+      - file: services/gateway/src/ohent_gateway/middleware.py
+        location: services/gateway/src/ohent_gateway/middleware.py:121-155
+        snippet: 'async with httpx.AsyncClient(timeout=30.0) as client:'
+      - file: services/scheduler/src/ohent_scheduler/proxy.py
+        location: services/scheduler/src/ohent_scheduler/proxy.py:49-76
+        snippet: 'async with httpx.AsyncClient(timeout=30.0) as client:'
+    prevalence: common
+
+  - category: architecture
+    pattern: 内部路由使用 /internal/ 前缀
+    description: "后端服务暴露 /internal/* 路由，Scheduler 代理将 /api/v1/* 重写为 /internal/* 后转发。"
+    examples:
+      - file: services/scheduler/src/ohent_scheduler/proxy.py
+        location: services/scheduler/src/ohent_scheduler/proxy.py:6-12
+        snippet: 'ROUTE_TABLE: dict[str, tuple[str, str]] = { "/api/v1/auth": (AUTH_URL, "/internal/auth"), ... }'
+    prevalence: common
+
+  - category: naming
+    pattern: 全局单例模式（模块级变量 + get_xxx 函数）
+    description: "每个服务使用模块级 _service 变量和 get_service() 函数管理单例。"
+    examples:
+      - file: services/host/src/ohent_host/api/v1/agents.py
+        location: services/host/src/ohent_host/api/v1/agents.py:8-13
+        snippet: '_service: HostService | None = None\ndef get_service() -> HostService:'
+    prevalence: common
+
+  - category: error_handling
+    pattern: 混合使用 OHError+HTTPException 和 error_response+JSONResponse
+    description: "部分路由使用 OHError 生成 HTTPException，部分直接返回 JSONResponse。不统一。"
+    examples:
+      - file: services/host/src/ohent_host/api/v1/agents.py
+        location: services/host/src/ohent_host/api/v1/agents.py:29-34
+        snippet: 'err = OHError(code="NOT_FOUND", ...)\nraise HTTPException(status_code=err["status_code"], detail=err["detail"])'
+      - file: services/auth/src/ohent_auth/api/v1/auth.py
+        location: services/auth/src/ohent_auth/api/v1/auth.py:20-31
+        snippet: 'return JSONResponse(content=body, status_code=status)'
+    prevalence: common
+
+  - category: structure
+    pattern: 统一项目结构 services/{name}/src/ohent_{name}/
+    description: "每个服务遵循相同目录结构：config.py, main.py, service.py, api/v1/*.py"
+    prevalence: universal
+
+# ==================================================================
+# 三、API 协议 vs 实际实现对照
+# ==================================================================
+
+api_endpoint_audit:
+  auth:
+    implemented:
+      - "POST /api/v1/auth/login - 已实现（API Key→JWT）"
+      - "POST /api/v1/auth/refresh - 已实现（refresh token 续期）"
+      - "POST /api/v1/auth/logout - 已实现（空实现，不使 token 失效）"
+      - "GET /api/v1/auth/me - 已实现（解析 Bearer token 返回用户信息）"
+    missing:
+      - "无。auth 4 个端点全部实现（但功能是 skeleton 级别）"
+
+  agents:
+    implemented:
+      - "GET /api/v1/agents - 已实现（列表，无分页/筛选参数）"
+      - "POST /api/v1/agents - 已实现（创建，支持 name/template_id/model/config）"
+      - "GET /api/v1/agents/{id} - 已实现（详情）"
+      - "DELETE /api/v1/agents/{id} - 已实现（销毁）"
+      - "POST /api/v1/agents/{id}/message - 已实现（发送消息）"
+    missing:
+      - "POST /api/v1/agents/{id}/restart - 未实现"
+      - "POST /api/v1/agents/batch-restart - 未实现"
+      - "POST /api/v1/agents/batch-destroy - 未实现"
+      - "WS /api/v1/agents/{id}/stream - 未实现（WebSocket 流式交互）"
+      - "POST /api/v1/agents/{id}/command - 未实现（执行命令）"
+      - "POST /api/v1/agents/{id}/skills - 未实现（安装 Skill）"
+      - "POST /api/v1/agents/{id}/mcp - 未实现（配置 MCP）"
+      - "PUT /api/v1/agents/{id}/config - 未实现（修改配置）"
+      - "GET /api/v1/agents/{id}/monitor - 未实现（监控数据）"
+      - "GET /api/v1/agents/{id}/memory/tree - 未实现（记忆文件树）"
+      - "POST /api/v1/agents/{id}/memory/upload - 未实现（上传记忆）"
+      - "GET /api/v1/agents/{id}/memory/download - 未实现（下载记忆）"
+    skeleton_issues:
+      - "list_agents 不支持 page/page_size/status/name/created_after 筛选参数"
+      - "create_agent 不返回 task_id（协议要求异步创建）"
+      - "destroy_agent 不返回 task_id"
+      - "send_message 不支持 stream=true 参数（无 SSE/WebSocket）"
+      - "无状态管理（creating→running→seeding→ready 生命周期）"
+
+  builder:
+    implemented: []
+    missing:
+      - "GET /api/v1/builder/configs - 未实现（Agent 配置列表）"
+      - "GET /api/v1/builder/configs/{id} - 未实现"
+      - "POST /api/v1/builder/configs - 未实现（创建配置）"
+      - "PUT /api/v1/builder/configs/{id} - 未实现（更新配置）"
+      - "DELETE /api/v1/builder/configs/{id} - 未实现"
+      - "POST /api/v1/builder/configs/{id}/publish - 未实现（发布到市场）"
+      - "POST /api/v1/builder/configs/{id}/duplicate - 未实现"
+      - "GET /api/v1/builder/configs/{id}/versions - 未实现"
+      - "POST /api/v1/builder/configs/{id}/preview - 未实现"
+      - "POST /api/v1/builder/configs/validate - 未实现"
+      - "POST /api/v1/builder/configs/import - 未实现"
+      - "GET /api/v1/builder/configs/{id}/export - 未实现"
+
+  market:
+    implemented:
+      - "GET /api/v1/market/templates - 已实现（分页+category+keyword 筛选）"
+      - "GET /api/v1/market/templates/{id} - 已实现"
+      - "GET /api/v1/market/skills - 已实现（分页+keyword）"
+      - "GET /api/v1/market/mcps - 已实现（分页+keyword）"
+    missing:
+      - "GET /api/v1/market/skills/{id} - 未实现（Skill 详情）"
+      - "GET /api/v1/market/mcps/{id} - 未实现（MCP 详情）"
+      - "GET /api/v1/market/categories - 未实现（分类列表）"
+
+  billing:
+    implemented:
+      - "GET /api/v1/billing/usage/summary - 已实现（注意：路径多了 /usage）"
+      - "GET /api/v1/billing/usage/records - 已实现（注意：路径多了 /usage）"
+    missing:
+      - "GET /api/v1/billing/records - 协议定义的路径（当前是 /billing/usage/records）"
+      - "GET /api/v1/billing/export - 未实现（账单导出 CSV）"
+      - "GET /api/v1/billing/budget - 未实现（查看预算）"
+      - "PUT /api/v1/billing/budget - 未实现（设置预算）"
+    skeleton_issues:
+      - "summary 缺少 budget/budget_remaining 字段"
+      - "summary 缺少 by_instance 维度聚合"
+      - "固定费率，不支持差异化定价规则"
+
+  memory:
+    implemented:
+      - "GET /api/v1/memory/assets - 已实现（列表，支持 path 前缀过滤）"
+      - "GET /api/v1/memory/assets/{path} - 已实现"
+      - "POST /api/v1/memory/assets - 已实现（创建/更新）"
+      - "DELETE /api/v1/memory/assets/{path} - 已实现"
+    missing:
+      - "PUT /api/v1/memory/assets/{path} - 未实现（协议定义为 PUT 上传，当前用 POST）"
+      - "GET /api/v1/memory/search - 未实现（关键词搜索）"
+      - "multipart/form-data 文件上传支持 - 未实现（当前只接受 JSON body）"
+    skeleton_issues:
+      - "不支持 recursive=true 参数（递归目录列表）"
+      - "无目录类型（所有资产都是 file 类型）"
+
+  org_permissions:
+    implemented: []
+    missing:
+      - "GET /api/v1/org/tree - 未实现"
+      - "GET /api/v1/org/{id} - 未实现"
+      - "POST /api/v1/org - 未实现"
+      - "GET /api/v1/org/{id}/members - 未实现"
+      - "POST /api/v1/org/{id}/members - 未实现"
+      - "DELETE /api/v1/org/{id}/members/{user_id} - 未实现"
+      - "PUT /api/v1/org/{id}/members/{user_id} - 未实现"
+      - "GET /api/v1/org/{id}/api-keys - 未实现"
+      - "POST /api/v1/org/{id}/api-keys - 未实现"
+      - "DELETE /api/v1/org/{id}/api-keys/{key_id} - 未实现"
+      - "POST /api/v1/org/{id}/api-keys/{key_id}/renew - 未实现"
+      - "GET /api/v1/permissions - 未实现"
+      - "GET /api/v1/roles - 未实现"
+      - "PUT /api/v1/roles/{id} - 未实现"
+
+  approvals:
+    implemented: []
+    missing:
+      - "GET /api/v1/approvals - 未实现"
+      - "POST /api/v1/approvals/{id}/approve - 未实现"
+      - "POST /api/v1/approvals/{id}/reject - 未实现"
+      - "GET /api/v1/approvals/history - 未实现"
+
+  tasks:
+    implemented:
+      - "GET /api/v1/tasks/{task_id} - 已实现（骨架：内存 dict，未知任务返回 completed）"
+    missing: []
+
+# ==================================================================
+# 四、数据存储方式评估
+# ==================================================================
+
+data_storage_assessment:
+  shared_lib_infrastructure:
+    sqlalchemy: "shared/db.py 已实现 async engine + session factory + Base + get_db 依赖注入，但无任何服务 import 使用"
+    redis: "shared/redis.py 已实现 get_redis/close_redis 懒加载单例，但无任何服务 import 使用"
+    service_client: "shared/service_client.py 已实现 ServiceClient（httpx async），但无服务使用（各服务自行创建 httpx.AsyncClient）"
+  actual_storage_by_service:
+    auth: "内存 dict `_API_KEYS` - 3 个硬编码种子 key，无数据库"
+    host: "SDK 的 SQLite (`instances.db` 在临时目录) + noop runtime"
+    scheduler: "内存 dict `_tasks` - 任务状态"
+    memory: "内存 dict `_assets` - 路径→资产内容"
+    market: "内存 list `_templates`/`_skills`/`_mcps` - 种子数据"
+    billing: "内存 list `_records` - 5 条种子记录"
+
+# ==================================================================
+# 五、骨架 vs 完整度评估
+# ==================================================================
+
+completeness_assessment:
+  shared:
+    completeness: "95% - 基础设施完善，可直接用于生产"
+    notes: "config/db/redis/errors/responses/schemas/security/service_client/api_mapping 全部实现。唯一缺少的是 SQLAlchemy ORM 模型定义（各服务未创建表模型）。"
+  gateway:
+    completeness: "40% - 核心中间件完成，缺少限流/熔断/负载均衡/审计日志/WebSocket"
+    implemented_features:
+      - "JWT 认证（解析+验证+过期检测）"
+      - "request_id 注入（UUID v4）"
+      - "PUBLIC_PATHS 免认证"
+      - "请求转发到 Scheduler"
+      - "用户信息注入 request.state"
+    missing_features:
+      - "限流（全局限流/组织级/用户级/接口级）"
+      - "熔断机制"
+      - "负载均衡"
+      - "请求审计日志"
+      - "WebSocket 代理"
+      - "gRPC 通道"
+      - "TLS 终止"
+      - "API Key 认证方式（X-OH-API-Key）"
+      - "路径鉴权预检（管理员接口）"
+      - "连接池（每次请求创建新 httpx.AsyncClient）"
+  auth:
+    completeness: "35% - 4 个端点全部实现但功能为骨架级别"
+    implemented_features:
+      - "API Key 登录 → JWT"
+      - "Refresh token 续期"
+      - "/me 端点"
+    missing_features:
+      - "API Key 持久化存储（PostgreSQL）"
+      - "组织层级 API Key（当前是扁平的）"
+      - "Token 黑名单（Redis）- logout 不使 token 失效"
+      - "API Key 过期与轮换"
+      - "权限管理服务（org CRUD、成员管理、角色管理）- 整块缺失"
+    skeleton_issues:
+      - "get_user_info 返回空 name（因为 JWT 中不含 name）"
+      - "logout 是空操作"
+  host:
+    completeness: "30% - 基础 CRUD 实现，大量 Agent 操控端点缺失"
+    implemented_features:
+      - "Agent CRUD（create/list/get/destroy）"
+      - "send_message（通过 SDK）"
+      - "API→SDK 映射层"
+    missing_features:
+      - "Agent restart / batch-restart / batch-destroy"
+      - "WebSocket 流式交互"
+      - "执行命令"
+      - "安装 Skill / 配置 MCP"
+      - "修改配置"
+      - "监控数据（CPU/内存/Token）"
+      - "记忆文件树/上传/下载"
+      - "多进程管理（当前是单进程 SDK）"
+    skeleton_issues:
+      - "使用 noop runtime，不启动真实容器"
+      - "DS_API_KEY 硬编码在 main.py"
+      - "list_agents 不支持分页和筛选"
+  scheduler:
+    completeness: "25% - 纯代理，无实际调度能力"
+    implemented_features:
+      - "请求代理（ROUTE_TABLE → httpx 转发）"
+      - "任务状态查询（内存 dict）"
+    missing_features:
+      - "Celery 集成（异步任务队列）"
+      - "优先级调度"
+      - "定时任务（闲置回收、报表生成、健康检查）"
+      - "服务注册与发现"
+      - "实例生命周期管理"
+      - "配置中心 / 热更新"
+      - "事件总线"
+      - "org/* 路由（组织管理）"
+      - "builder/* 路由（Agent 构建）"
+      - "approvals/* 路由（审批）"
+      - "billing/budget 路由"
+      - "billing/export 路由"
+      - "memory/search 路由"
+    skeleton_issues:
+      - "未知任务直接返回 completed（应该返回 NOT_FOUND 或 pending）"
+      - "ROUTE_TABLE 缺少 org/builder/approvals 路由"
+  memory:
+    completeness: "25% - 基础 CRUD，缺少搜索/目录/大文件"
+    implemented_features:
+      - "资产 CRUD（create/get/list/delete）"
+      - "路径前缀过滤"
+    missing_features:
+      - "关键词搜索"
+      - "目录类型支持"
+      - "递归目录列表"
+      - "文件上传（multipart/form-data）"
+      - "PostgreSQL + ltree 路径索引"
+      - "大文件存储（对象存储引用）"
+    skeleton_issues:
+      - "PUT 方法未实现（协议要求 PUT 上传）"
+      - "内存 dict 无容量限制"
+  market:
+    completeness: "30% - 列表查询完善，详情端点部分缺失"
+    implemented_features:
+      - "模板列表（分页+category+keyword）"
+      - "模板详情"
+      - "Skill/MCP 列表"
+    missing_features:
+      - "Skill 详情"
+      - "MCP 详情"
+      - "分类列表"
+      - "模板 CRUD（当前只有种子数据，无增删改）"
+      - "publish/duplicate/versions/preview/validate/import/export（整个 Builder 模块缺失）"
+    skeleton_issues:
+      - "只有种子数据，无持久化"
+      - "无订阅/安装功能"
+  billing:
+    completeness: "20% - 基础汇总和列表，缺大量功能"
+    implemented_features:
+      - "费用汇总（by_model + daily_trend）"
+      - "账单明细（分页+筛选）"
+    missing_features:
+      - "预算管理（查看/设置/告警）"
+      - "账单导出（CSV）"
+      - "by_instance 维度聚合"
+      - "budget/budget_remaining 字段"
+      - "差异化定价（按模型/Agent 类型）"
+      - "费用告警"
+      - "组织层级聚合"
+    skeleton_issues:
+      - "路由前缀多了 /usage（协议是 /billing/summary，实际是 /billing/usage/summary）"
+      - "固定费率"
+      - "无实际计费事件接入"
+
+# ==================================================================
+# 六、测试覆盖评估
+# ==================================================================
+
+testing_patterns:
+  framework: "pytest + httpx.AsyncClient + ASGITransport（模拟 FastAPI 请求）"
+  coverage_areas:
+    - "各服务 health 端点"
+    - "auth: login/refresh/me/logout（正常+错误）"
+    - "host: CRUD + send_message + not_found"
+    - "market: templates/skills/mcps 列表 + 详情 + 分页 + 筛选"
+    - "memory: CRUD + path 过滤 + update"
+    - "billing: summary + records + 筛选 + 分页"
+    - "gateway: middleware（auth/no-auth/expired/invalid/upstream-error）"
+    - "scheduler: proxy 路由转发 + task status"
+    - "shared: errors/responses/security/schemas"
+    - "api_mapping: InstanceMapper 创建/模板映射"
+    - "sdk_noop: SDK noop driver 端到端"
+    - "E2E: gateway→scheduler→auth/host 全链路"
+    - "integration: 跨服务访问（market/billing/memory via gateway）"
+  test_count_by_file:
+    test_shared: "~20 tests"
+    test_auth: "11 tests"
+    test_host: "11 tests"
+    test_market: "11 tests"
+    test_memory: "11 tests"
+    test_billing: "9 tests"
+    test_gateway: "7 tests"
+    test_scheduler: "~10 tests"
+    test_health_*: "7 files × 1 test = 7 tests"
+    test_api_mapping: "5 tests"
+    test_sdk_noop: "2 tests"
+    test_e2e_full_chain: "8 tests (marked e2e)"
+    test_integration: "3 tests (marked integration)"
+  total_tests: "~123"
+  mock_patterns:
+    - "unittest.mock.patch 替换 httpx.AsyncClient（gateway/scheduler 测试）"
+    - "模块级 _service=None 重置单例（host/market/memory 测试）"
+    - "autouse fixture 初始化种子数据（auth/billing 测试）"
+
+testing_gaps:
+  missing_boundary_tests:
+    - "空字符串/空列表输入验证（所有服务）"
+    - "超长字符串输入（name 超过 255 字符等）"
+    - "特殊字符/SQL 注入/XSS 输入"
+    - "page=0 或 page=-1 或 page_size=0 等非法分页参数"
+    - "超大 page_size（>100）"
+    - "path traversal 攻击（../../../etc/passwd）"
+    - "并发请求竞争条件（同一资源同时更新）"
+  missing_error_path_tests:
+    - "数据库连接失败场景"
+    - "Redis 连接失败场景"
+    - "下游服务超时（当前只测了 connection refused）"
+    - "无效 JSON body 格式"
+    - "缺少必填字段（如 login 不传 api_key）"
+    - "重复创建（CONFLICT 错误码）"
+  missing_security_tests:
+    - "伪造 JWT（篡改 payload）"
+    - "过期 refresh token"
+    - "跨租户访问（user A 访问 user B 的资源）"
+    - "权限不足访问（FORBIDDEN 错误码）"
+    - "API Key 泄露/暴力破解"
+  missing_service_specific_tests:
+    auth:
+      - "API Key 为空字符串"
+      - "同时多次 refresh 同一个 token"
+      - "使用 access token 作为 refresh token"
+    host:
+      - "创建同名 Agent（CONFLICT）"
+      - "销毁不存在的 Agent"
+      - "send_message 到已销毁的 Agent"
+      - "batch 操作（未实现，需先实现）"
+    market:
+      - "keyword 为空字符串"
+      - "category 不存在时返回空列表"
+      - "get_template 传入非法 ID 格式"
+    memory:
+      - "创建路径为空字符串的资产"
+      - "创建路径包含 null byte 的资产"
+      - "删除已被删除的资产（幂等性）"
+    billing:
+      - "period 参数为非法值"
+      - "start_date > end_date"
+      - "导出 CSV（未实现）"
+
+# ==================================================================
+# 七、缺失功能汇总（按优先级）
+# ==================================================================
+
+critical_gaps:
+  - area: "数据库持久化"
+    description: "所有服务使用内存存储，需迁移到 PostgreSQL（shared/db.py 已就绪）"
+    impact: decision_blocker
+    affects: ["auth", "host", "memory", "market", "billing", "scheduler"]
+  - area: "组织与权限管理"
+    description: "org/* 全部 14 个端点未实现，是 Agent 申领流程的前提"
+    impact: decision_blocker
+    affects: ["auth", "scheduler"]
+  - area: "Builder 模块"
+    description: "builder/* 全部 12 个端点未实现，是市场发布 Agent 配置的核心功能"
+    impact: decision_blocker
+    affects: ["market", "scheduler"]
+  - area: "审批模块"
+    description: "approvals/* 全部 4 个端点未实现"
+    impact: research_blocker
+    affects: ["scheduler"]
+  - area: "Celery 任务队列"
+    description: "scheduler 无实际任务调度能力，所有操作都是同步的"
+    impact: decision_blocker
+    affects: ["scheduler", "host"]
+
+high_priority_gaps:
+  - area: "Agent 操控端点"
+    description: "12 个 Agent 端点未实现（restart/command/skills/mcp/config/monitor/memory）"
+    impact: research_blocker
+    affects: ["host"]
+  - area: "WebSocket 流式交互"
+    description: "ws://api/v1/agents/{id}/stream 未实现，影响用户体验"
+    impact: research_blocker
+    affects: ["gateway", "host"]
+  - area: "限流与熔断"
+    description: "网关无限流/熔断/负载均衡能力"
+    impact: research_blocker
+    affects: ["gateway"]
+  - area: "Token 黑名单（Redis）"
+    description: "logout 不使 token 失效，存在安全隐患"
+    impact: research_blocker
+    affects: ["auth", "shared"]
+  - area: "记忆服务搜索"
+    description: "GET /api/v1/memory/search 未实现"
+    impact: nice_to_know
+    affects: ["memory"]
+
+medium_priority_gaps:
+  - area: "计费预算管理"
+    description: "budget CRUD + 告警 + 导出 CSV"
+    impact: nice_to_know
+    affects: ["billing"]
+  - area: "Skill/MCP 详情端点"
+    description: "market/skills/{id} 和 market/mcps/{id} 未实现"
+    impact: nice_to_know
+    affects: ["market"]
+  - area: "分类列表"
+    description: "GET /api/v1/market/categories 未实现"
+    impact: nice_to_know
+    affects: ["market"]
+  - area: "连接池"
+    description: "gateway 和 scheduler 每次请求创建新 httpx.AsyncClient，性能问题"
+    impact: nice_to_know
+    affects: ["gateway", "scheduler"]
+  - area: "审计日志"
+    description: "网关无请求审计日志"
+    impact: nice_to_know
+    affects: ["gateway"]
+
+# ==================================================================
+# 八、代码统计汇总
+# ==================================================================
+
+code_statistics:
+  services_total_files: 62
+  services_total_lines: 1044
+  tests_total_files: 19
+  tests_total_lines: 1654
+  test_to_code_ratio: "1.58:1"
+  by_service:
+    shared:
+      files: 11
+      lines: 272
+      status: "完善（基础设施层）"
+    gateway:
+      files: 5
+      lines: 178
+      status: "核心完成，扩展功能缺失"
+    auth:
+      files: 9
+      lines: 190
+      status: "骨架完成，组织权限全缺"
+    host:
+      files: 8
+      lines: 139
+      status: "基础 CRUD，大量端点缺失"
+    scheduler:
+      files: 5
+      lines: 136
+      status: "纯代理，无调度能力"
+    memory:
+      files: 9
+      lines: 139
+      status: "基础 CRUD，搜索/大文件缺失"
+    market:
+      files: 8
+      lines: 240
+      status: "只读查询完善，Builder 缺失"
+    billing:
+      files: 8
+      lines: 192
+      status: "基础汇总，预算/导出缺失"
+
+open_questions:
+  - question: "Builder 模块是否由 market 服务承载，还是新建独立服务？"
+    context: "api-protocol.md §3.1 定义 /api/v1/builder/* → 市场服务，但当前 market 服务无 builder 代码"
+    type: decision_blocker
+    affects: ["market", "scheduler"]
+  - question: "Org/权限模块是否由 auth 服务承载，还是新建独立服务？"
+    context: "api-protocol.md §3.1 定义 /api/v1/org/* → 权限管理服务（认证子模块），当前 auth 服务只有 login/refresh/logout/me"
+    type: decision_blocker
+    affects: ["auth", "scheduler"]
+  - question: "Scheduler 的 Celery broker 是否使用 Redis（require.md §7.3 定义）？"
+    context: "shared/redis.py 已就绪，但 scheduler 未集成 Celery"
+    type: research
+    affects: ["scheduler"]
+  - question: "Agent 实例的 SDK runtime 在生产环境是否使用 Podman？"
+    context: "当前使用 noop runtime；require.md §7.2 定义使用 Podman 容器运行时"
+    type: research
+    affects: ["host"]
+  - question: "计费费率是否需要数据库存储支持动态配置？"
+    context: "当前 _calc_cost 是固定函数；require.md §5.3 提到差异化定价和自定义计费规则"
+    type: research
+    affects: ["billing"]
+  - question: "记忆服务的大文件存储策略（本地文件系统 vs MinIO）何时切换？"
+    context: "require.md §7.3 定义开发阶段本地文件系统，生产阶段 MinIO"
+    type: nice_to_know
+    affects: ["memory"]
+
+gaps:
+  - area: "API 路由前缀不一致"
+    description: "billing 的实际路由 /internal/billing/usage/* 与 api-protocol.md 定义的 /internal/billing/* 不一致"
+    impact: research_blocker
+    affects: ["billing", "scheduler"]
+  - area: "httpx 连接池缺失"
+    description: "gateway 和 scheduler 每次请求创建新 httpx.AsyncClient，生产环境会有性能和文件描述符问题"
+    impact: nice_to_know
+    affects: ["gateway", "scheduler"]
+  - area: "错误处理不统一"
+    description: "部分路由使用 OHError+HTTPException，部分使用 error_response+JSONResponse，部分直接 raise RuntimeError"
+    impact: nice_to_know
+    affects: ["auth", "host", "memory", "market"]
+  - area: "ServiceClient 未被使用"
+    description: "shared/service_client.py 已实现但各服务自行创建 httpx.AsyncClient"
+    impact: nice_to_know
+    affects: ["scheduler", "shared"]

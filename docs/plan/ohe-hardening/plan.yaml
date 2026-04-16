@@ -1,0 +1,1075 @@
+plan_id: ohe-hardening
+objective: "OpenHarness Enterprise 基础加固 — 将 25 个已实现端点从内存存储迁移到 SQLite 持久化，添加完整输入验证和边界错误测试，实现全链路冒烟覆盖"
+created_at: "2026-04-16T00:00:00Z"
+created_by: gem-planner
+status: pending
+research_confidence: high
+
+plan_metrics:
+  wave_1_task_count: 1
+  total_dependencies: 14
+  risk_score: low
+
+tldr: |
+  将 8 个微服务从内存 dict 迁移到 SQLite (aiosqlite) 持久化。
+  为 Auth/Memory/Market/Billing 添加输入验证加固（空值、超长、注入、边界分页）。
+  全链路冒烟测试覆盖 Gateway → 每个后端服务的完整链路。
+  不引入新功能，纯生产化加固。
+
+open_questions:
+  - "Host 服务使用 SDK 的 SQLite 实例库 (instances.db)，是否也需要迁移到统一 shared 的 SQLite？"
+  - "Gateway 的 JWT 中间件是否有独立的 token 黑名单存储需求（Redis）？"
+  - "[已决策] 使用 SQLite 替代 PostgreSQL（Podman 不可用），后续可迁移回 PG"
+  - "[已决策] Memory path pattern 拒绝 '..' 路径穿越序列（service 层验证）"
+
+pre_mortem:
+  overall_risk_level: low
+  critical_failure_modes:
+    - scenario: "SQLite 在并发写入时出现 database locked 错误"
+      likelihood: medium
+      impact: medium
+      mitigation: "SQLite WAL 模式 + 设置合理的 timeout，单机开发环境并发量低"
+    - scenario: "aiosqlite 与 SQLAlchemy async session 的兼容性问题"
+      likelihood: low
+      impact: high
+      mitigation: "Wave 1 首先验证 engine 创建和 session 工厂，失败则回退到同步 sqlite3"
+    - scenario: "现有 123 个测试在 shared 库修改 URL 默认值后失败"
+      likelihood: low
+      impact: medium
+      mitigation: "仅在 shared config.py 修改默认值，各服务可通过环境变量覆盖；测试使用隔离 fixture"
+  assumptions:
+    - "Podman 不可用，SQLite 是唯一可行的数据库方案"
+    - "fakeredis 仅用于测试，生产环境 Redis 可后续接入"
+    - "所有服务的 Pydantic schema 验证在 API 层完成，service 层依赖 schema 校验后的数据"
+    - "Host 服务使用 SDK 自带 SQLite，不在本次加固范围（SDK 内部事务）"
+    - "Gateway 和 Scheduler 是纯代理/转发服务，无需独立持久化"
+
+implementation_specification:
+  code_structure: |
+    每个 service 新增 models.py (SQLAlchemy ORM)。
+    shared/db.py 修改为支持 SQLite + WAL 模式。
+    shared/redis.py 修改为支持 fakeredis 回退。
+    各 service 的 main.py lifespan 中初始化数据库表 + seed 数据。
+    各 service 的 API layer 添加 Pydantic 验证。
+  affected_areas:
+    - "services/shared/src/ohent_shared/config.py — DatabaseSettings.url 默认值改为 SQLite"
+    - "services/shared/src/ohent_shared/db.py — SQLite WAL 模式 + pool 参数适配"
+    - "services/shared/src/ohent_shared/redis.py — fakeredis 回退支持"
+    - "services/shared/pyproject.toml — 添加 aiosqlite, fakeredis 依赖"
+    - "services/auth/src/ohent_auth/ — models.py + service.py 重写 + schemas 验证加固 + API 验证"
+    - "services/memory/src/ohent_memory/ — models.py + service.py 重写 + schemas 验证加固 + API 验证"
+    - "services/market/src/ohent_market/ — models.py + service.py 重写 + API 验证"
+    - "services/billing/src/ohent_billing/ — models.py + service.py 重写 + API 验证"
+    - "tests/ — 所有服务的边界测试 + 冒烟测试"
+  component_details:
+    - component: "shared/db.py"
+      responsibility: "提供 async SQLAlchemy engine/session，支持 SQLite WAL 模式"
+      interfaces:
+        - "engine: AsyncEngine"
+        - "async_session_factory: async_sessionmaker"
+        - "get_db(): AsyncSession generator"
+        - "init_db(): 创建所有注册表"
+    - component: "shared/redis.py"
+      responsibility: "提供 Redis 客户端，测试环境回退 fakeredis"
+      interfaces:
+        - "get_redis(): Redis"
+        - "close_redis(): None"
+    - component: "shared/schemas.py"
+      responsibility: "通用分页、用户信息等共享 Pydantic 模型"
+      interfaces:
+        - "PaginatedQuery(page, page_size)"
+        - "UserInfo(id, name, role, org_id, permissions)"
+    - component: "auth/models.py"
+      responsibility: "ApiKey ORM 模型（id, key_hash, user_id, name, role, org_id, permissions, created_at, is_active）"
+      interfaces:
+        - "ApiKey class (SQLAlchemy model)"
+    - component: "memory/models.py"
+      responsibility: "Asset ORM 模型（id, path, name, content, content_type, created_at, updated_at）"
+      interfaces:
+        - "Asset class (SQLAlchemy model)"
+    - component: "market/models.py"
+      responsibility: "Template/Skill/Mcp ORM 模型"
+      interfaces:
+        - "Template, Skill, Mcp classes (SQLAlchemy models)"
+    - component: "billing/models.py"
+      responsibility: "UsageRecord ORM 模型（id, instance_id, model, input_tokens, output_tokens, cost, created_at）"
+      interfaces:
+        - "UsageRecord class (SQLAlchemy model)"
+  dependencies:
+    - component: "shared/db.py"
+      relationship: "所有 service 依赖 shared 提供的 get_db() 获取数据库 session"
+    - component: "shared/redis.py"
+      relationship: "所有 service 可选依赖 get_redis()（本次仅基础设施准备）"
+    - component: "auth/models.py → memory/models.py → market/models.py → billing/models.py"
+      relationship: "各服务 models 依赖 shared/db.py 的 Base 类"
+  integration_points:
+    - "shared/pyproject.toml 添加 aiosqlite, fakeredis 依赖"
+    - "各 service main.py lifespan 中调用 init_db() 创建表 + seed 数据"
+    - "各 service API layer 使用 Pydantic schema 做输入验证"
+    - "测试文件通过 pytest fixture 注入内存 SQLite (sqlite+aiosqlite:///)"
+
+contracts:
+  - from_task: "ohh-1-infra-shared-deps"
+    to_task: "ohh-1-infra-shared-db"
+    interface: "aiosqlite 已安装，可创建 SQLite async engine"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-1-infra-shared-deps"
+    to_task: "ohh-1-infra-shared-redis"
+    interface: "fakeredis 已安装，测试环境可回退 FakeRedis"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-1-infra-shared-db"
+    to_task: "ohh-2-auth-persist"
+    interface: "aiosqlite 已安装；shared Base/engine 可用"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-1-infra-shared-db"
+    to_task: "ohh-3-memory-persist"
+    interface: "同上"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-1-infra-shared-db"
+    to_task: "ohh-4-market-persist"
+    interface: "同上"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-1-infra-shared-db"
+    to_task: "ohh-5-billing-persist"
+    interface: "同上"
+    format: "Python 包依赖"
+
+  - from_task: "ohh-2-auth-persist"
+    to_task: "ohh-2-auth-validate"
+    interface: "Auth service.py 使用 SQLite 存取 API Keys"
+    format: "Python module API"
+
+  - from_task: "ohh-2-auth-validate"
+    to_task: "ohh-6-smoke-auth"
+    interface: "Auth API 层有完整输入验证"
+    format: "FastAPI router"
+
+  - from_task: "ohh-3-memory-persist"
+    to_task: "ohh-3-memory-validate"
+    interface: "Memory service.py 使用 SQLite 存取 Assets"
+    format: "Python module API"
+
+  - from_task: "ohh-3-memory-validate"
+    to_task: "ohh-6-smoke-memory"
+    interface: "Memory API 层有完整输入验证"
+    format: "FastAPI router"
+
+  - from_task: "ohh-4-market-persist"
+    to_task: "ohh-4-market-validate"
+    interface: "Market service.py 使用 SQLite 存取 Templates/Skills/MCPs"
+    format: "Python module API"
+
+  - from_task: "ohh-4-market-validate"
+    to_task: "ohh-6-smoke-market"
+    interface: "Market API 层有完整输入验证"
+    format: "FastAPI router"
+
+  - from_task: "ohh-5-billing-persist"
+    to_task: "ohh-5-billing-validate"
+    interface: "Billing service.py 使用 SQLite 存取 UsageRecords"
+    format: "Python module API"
+
+  - from_task: "ohh-5-billing-validate"
+    to_task: "ohh-6-smoke-billing"
+    interface: "Billing API 层有完整输入验证"
+    format: "FastAPI router"
+
+  - from_task: "ohh-6-smoke-auth"
+    to_task: "ohh-6-smoke-integration"
+    interface: "Auth 冒烟测试全部通过"
+    format: "pytest results"
+
+  - from_task: "ohh-6-smoke-memory"
+    to_task: "ohh-6-smoke-integration"
+    interface: "Memory 冒烟测试全部通过"
+    format: "pytest results"
+
+  - from_task: "ohh-6-smoke-market"
+    to_task: "ohh-6-smoke-integration"
+    interface: "Market 冒烟测试全部通过"
+    format: "pytest results"
+
+  - from_task: "ohh-6-smoke-billing"
+    to_task: "ohh-6-smoke-integration"
+    interface: "Billing 冒烟测试全部通过"
+    format: "pytest results"
+
+tasks:
+  # ================================================================
+  # Wave 1: SQLite + Redis 基础设施
+  # ================================================================
+  - id: ohh-1-infra-shared-db
+    title: "SQLite 持久化基础设施 — shared/db.py 改造"
+    description: |
+      修改 shared/db.py 和 shared/config.py 支持 SQLite：
+      1. config.py: DatabaseSettings.url 默认值改为 sqlite+aiosqlite:///./ohent_dev.db
+      2. db.py: engine 创建时移除 pool_size（SQLite 不支持），添加 connect_args={"check_same_thread": False, "timeout": 30}
+      3. db.py: 添加 WAL 模式支持（PRAGMA journal_mode=WAL）
+      4. db.py: 添加 init_db() 函数用于创建所有注册的表
+      5. db.py: 添加 override_engine(url) 函数支持测试时切换数据库 URL
+      6. db.py: engine 创建改为延迟初始化（函数 get_engine()），避免模块级导入触发连接
+    wave: 1
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/shared/src/ohent_shared/config.py"
+        description: "DatabaseSettings 配置类"
+      - path: "OpenHarnessEnterprise/services/shared/src/ohent_shared/db.py"
+        description: "当前 async engine/session 工厂"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 80
+    focus_area: "shared/db.py, shared/config.py"
+    verification:
+      - "Python import ohent_shared.db 成功，无报错"
+      - "创建 engine 后执行 CREATE TABLE 测试语句成功"
+      - "async with async_session_factory() as session 正常工作"
+      - "init_db() 能创建空表无报错"
+    acceptance_criteria:
+      - "DatabaseSettings.url 默认值为 sqlite+aiosqlite:///./ohent_dev.db"
+      - "engine 使用 AsyncSQLite 且无 pool_size 参数"
+      - "init_db() 函数存在并可正常创建表"
+      - "override_engine(url) 允许测试注入内存 SQLite"
+    failure_modes:
+      - scenario: "aiosqlite 未安装导致 import 失败"
+        likelihood: low
+        impact: high
+        mitigation: "Wave 1 deps task 先安装 aiosqlite"
+      - scenario: "SQLite 不支持 pool_size 参数导致 engine 创建报错"
+        likelihood: medium
+        impact: medium
+        mitigation: "条件判断：SQLite URL 时不传 pool_size 参数"
+    tech_stack:
+      - "sqlalchemy>=2.0.0"
+      - "aiosqlite"
+    test_coverage: "单元测试：engine 创建、session 获取、表创建"
+
+  - id: ohh-1-infra-shared-redis
+    title: "Redis fakeredis 回退支持"
+    description: |
+      修改 shared/redis.py 支持测试环境回退 fakeredis：
+      1. redis.py: 添加 is_testing() 检测（环境变量 OHENT_TESTING=1 或 url 以 fakeredis:// 开头）
+      2. redis.py: 测试环境下使用 fakeredis.aioredis.FakeRedis 替代真实 Redis
+      3. 保持现有 API 不变：get_redis() 返回 Redis 协议兼容对象
+    wave: 1
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/shared/src/ohent_shared/redis.py"
+        description: "当前 Redis 连接工厂"
+      - path: "OpenHarnessEnterprise/services/shared/src/ohent_shared/config.py"
+        description: "RedisSettings 配置类"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 40
+    focus_area: "shared/redis.py"
+    verification:
+      - "设置 OHENT_TESTING=1 后 get_redis() 返回 FakeRedis 实例"
+      - "FakeRedis 实例支持 get/set 操作"
+    acceptance_criteria:
+      - "测试环境下 get_redis() 使用 fakeredis"
+      - "非测试环境下行为不变"
+      - "API 接口保持兼容"
+    failure_modes:
+      - scenario: "fakeredis API 与真实 redis 不兼容"
+        likelihood: low
+        impact: low
+        mitigation: "本次仅基础设施准备，暂无业务代码依赖 Redis"
+    tech_stack:
+      - "redis>=5.0.0"
+      - "fakeredis"
+    test_coverage: "单元测试：测试/非测试环境下 get_redis() 行为"
+
+  - id: ohh-1-infra-shared-deps
+    title: "安装 aiosqlite + fakeredis 依赖"
+    description: |
+      1. shared/pyproject.toml 添加 aiosqlite, fakeredis 到 dependencies
+      2. pip install -e 安装验证
+      3. 验证现有 123 个测试不受影响（shared URL 默认值变更由 ohh-1-infra-shared-db 处理，此任务仅安装包）
+    wave: 1
+    agent: gem-devops
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies: []
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/shared/pyproject.toml"
+        description: "shared 包依赖配置"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 10
+    focus_area: "shared/pyproject.toml"
+    verification:
+      - "pip install aiosqlite fakeredis 成功"
+      - "import aiosqlite 成功"
+      - "import fakeredis 成功"
+      - "pytest tests/ 全部通过（验证无破坏性变更）"
+    acceptance_criteria:
+      - "pyproject.toml 包含 aiosqlite>=0.19.0, fakeredis>=2.20.0"
+      - "包可正常安装和导入"
+      - "现有测试全部通过"
+    failure_modes: []
+    environment: development
+    requires_approval: false
+    devops_security_sensitive: false
+
+  # ================================================================
+  # Wave 2: Auth 服务持久化 + 验证加固
+  # ================================================================
+  - id: ohh-2-auth-persist
+    title: "Auth 服务 SQLite 持久化"
+    description: |
+      1. 创建 auth/models.py: ApiKey ORM 模型（id: str PK, key_hash: str, user_id: str, name: str, role: str, org_id: str, permissions: JSON, created_at: datetime, is_active: bool）
+      2. 重写 auth/service.py: init_api_keys() 改为从 DB 读取或 seed 默认 keys；authenticate_api_key() 改为 DB 查询；login/refresh/me 使用 DB
+      3. 修改 auth/main.py lifespan: 初始化 DB 表 + seed 默认 API keys
+      4. seed 3 个默认 key: oh-admin-key, oh-org-admin-key, oh-user-key（与当前内存数据一致）
+      5. API key 存储 hash 值（hashlib.sha256），不存储明文
+    wave: 2
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-db"
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/service.py"
+        description: "当前内存 dict 存储 API keys"
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/main.py"
+        description: "FastAPI app + lifespan"
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/schemas.py"
+        description: "LoginRequest, RefreshRequest, TokenResponse"
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/api/v1/auth.py"
+        description: "4 个 auth 端点"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: "auth/models.py (new), auth/service.py, auth/main.py"
+    verification:
+      - "POST /internal/auth/login 返回 JWT token（与改造前一致）"
+      - "POST /internal/auth/refresh 返回新 token"
+      - "GET /internal/auth/me 返回用户信息"
+      - "重启服务后 API keys 持久化不丢失"
+      - "现有 test_auth.py 6 个测试全部通过"
+    acceptance_criteria:
+      - "ApiKey ORM 模型定义完整"
+      - "API key 以 SHA256 hash 形式存储"
+      - "3 个默认 key seed 到数据库"
+      - "login/refresh/me 端点行为与改造前一致"
+      - "服务重启后数据持久化"
+    failure_modes:
+      - scenario: "hash 计算与查询不匹配导致登录失败"
+        likelihood: low
+        impact: high
+        mitigation: "单元测试验证 hash 存储和查询一致性"
+      - scenario: "SQLite 事务与 async session 生命周期不匹配"
+        likelihood: low
+        impact: medium
+        mitigation: "复用 shared/db.py 的 get_db() generator 模式"
+    tech_stack:
+      - "sqlalchemy>=2.0.0"
+      - "aiosqlite"
+      - "pyjwt>=2.8.0"
+    test_coverage: "单元测试：模型创建、hash 存储、key 查询、seed 数据验证"
+
+  - id: ohh-2-auth-validate
+    title: "Auth 输入验证加固 + 边界测试"
+    description: |
+      1. 修改 auth/schemas.py LoginRequest: api_key 改为 str 类型，添加 Field(min_length=1, max_length=256, pattern=r'^[a-zA-Z0-9\-_]+$')
+      2. 修改 auth/schemas.py RefreshRequest: refresh_token 改为 str 类型，添加 Field(min_length=1, max_length=4096)
+      3. auth/api/v1/auth.py: 添加 FastAPI validation 异常处理器（422 统一格式）
+      4. login: 空 api_key → 422, 超长 api_key → 422, 非法字符 → 422
+      5. refresh: 空 token → 422, 过期 token → 401, 非法格式 → 401
+      6. 新增边界测试: test_auth_validation.py
+         - 空 api_key body
+         - api_key 超长 (300 字符)
+         - api_key 含 SQL 注入 ("' OR 1=1 --")
+         - api_key 含 XSS ("<script>alert(1)</script>")
+         - api_key 含特殊字符 ("key with spaces!")
+         - 空 refresh_token
+         - 过期 refresh_token
+         - 非法 JWT 格式 refresh_token
+    wave: 2
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-2-auth-persist"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/schemas.py"
+        description: "当前无验证约束的 schema"
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/api/v1/auth.py"
+        description: "Auth 端点路由"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: "auth/schemas.py, auth/api/v1/auth.py, tests/test_auth_validation.py"
+    verification:
+      - "空 api_key → 422 VALIDATION_ERROR"
+      - "超长 api_key → 422 VALIDATION_ERROR"
+      - "SQL 注入 api_key → 422 VALIDATION_ERROR"
+      - "正常 api_key → 200 成功"
+      - "所有边界测试通过"
+      - "原有 test_auth.py 仍然通过"
+    acceptance_criteria:
+      - "LoginRequest.api_key 有 min_length=1, max_length=256 约束"
+      - "RefreshRequest.refresh_token 有 min_length=1, max_length=4096 约束"
+      - "验证失败返回 422 + VALIDATION_ERROR code"
+      - "≥8 个边界测试用例全部通过"
+    failure_modes:
+      - scenario: "regex pattern 过严导致合法 key 被拒"
+        likelihood: low
+        impact: medium
+        mitigation: "pattern 使用宽松的白名单 [a-zA-Z0-9\-_]+，与现有 key 格式匹配"
+    tech_stack:
+      - "pydantic>=2.0.0"
+    test_coverage: "≥8 个边界测试：空值、超长、SQL注入、XSS、特殊字符、过期token"
+
+  # ================================================================
+  # Wave 3: Memory 服务持久化 + 验证加固
+  # ================================================================
+  - id: ohh-3-memory-persist
+    title: "Memory 服务 SQLite 持久化"
+    description: |
+      1. 创建 memory/models.py: Asset ORM 模型（id: str PK auto-gen, path: str unique, name: str, content: text, content_type: str, created_at: datetime, updated_at: datetime）
+      2. 重写 memory/service.py: 所有操作改为 async，使用 SQLAlchemy session
+         - create_asset: INSERT or UPDATE (UPSERT by path)
+         - get_asset: SELECT by path
+         - list_assets: SELECT with path_prefix filter
+         - delete_asset: DELETE by path
+      3. 修改 memory/main.py: lifespan 中初始化 DB 表 + seed 3 个默认 asset
+      4. seed 数据: system/prompt.txt, system/config.json, workspace/notes.md（与当前内存 seed 一致）
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-db"
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/service.py"
+        description: "当前 MemoryService 内存 dict 实现"
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/schemas.py"
+        description: "CreateAssetRequest (path, content, content_type)"
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/main.py"
+        description: "FastAPI app"
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/api/v1/assets.py"
+        description: "Asset CRUD 端点"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: "memory/models.py (new), memory/service.py, memory/main.py"
+    verification:
+      - "POST /internal/memory/assets 创建 asset 返回 200"
+      - "GET /internal/memory/assets 列出 assets（含 seed 数据）"
+      - "GET /internal/memory/assets/system/prompt.txt 返回具体 asset"
+      - "重启服务后数据持久化"
+      - "现有 memory 测试通过"
+    acceptance_criteria:
+      - "Asset ORM 模型定义完整，path 字段 unique 约束"
+      - "4 个 CRUD 操作全部使用 DB"
+      - "3 个 seed asset 在 lifespan 中写入"
+      - "重启后数据不丢失"
+    failure_modes:
+      - scenario: "path 的 unique 约束导致 UPSERT 失败"
+        likelihood: low
+        impact: medium
+        mitigation: "使用 SQLAlchemy merge() 或 INSERT ON CONFLICT"
+    tech_stack:
+      - "sqlalchemy>=2.0.0"
+      - "aiosqlite"
+    test_coverage: "单元测试：模型创建、CRUD 操作、seed 数据验证"
+
+  - id: ohh-3-memory-validate
+    title: "Memory 输入验证加固 + 边界测试"
+    description: |
+      1. 修改 memory/schemas.py CreateAssetRequest:
+         - path: Field(min_length=1, max_length=512, pattern=r'^[a-zA-Z0-9_\-./]+$', description="Asset path (no path traversal)")
+         - service 层额外验证: path 不包含 '..' 序列（防御路径穿越）
+         - content: Field(max_length=1048576)  # 1MB
+         - content_type: Field(default="text/plain", pattern=r'^[a-z]+/[a-z0-9.+-]+$')
+      2. 修改 assets.py API: 添加分页参数 page (ge=1), page_size (ge=1, le=100)
+      3. 添加 FastAPI 验证异常处理器
+      4. 新增边界测试: test_memory_validation.py
+         - 空 path body
+         - path 超长 (600 字符)
+         - path 含 SQL 注入 ("'; DROP TABLE assets; --")
+         - path 含路径穿越 ("../../etc/passwd")
+         - content 超大 (2MB)
+         - 空 content_type
+         - 非法 content_type ("not-a-type")
+         - 分页: page=0 → 422, page=-1 → 422, page_size=101 → 422, page_size=0 → 422
+    wave: 3
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-3-memory-persist"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/schemas.py"
+        description: "当前 CreateAssetRequest 无验证约束"
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/api/v1/assets.py"
+        description: "Asset 端点，当前无分页参数"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 280
+    focus_area: "memory/schemas.py, memory/api/v1/assets.py, tests/test_memory_validation.py"
+    verification:
+      - "空 path → 422"
+      - "SQL 注入 path → 422"
+      - "路径穿越 path → 422"
+      - "超大 content → 422"
+      - "非法 content_type → 422"
+      - "page=0 → 422, page_size=101 → 422"
+      - "所有边界测试通过"
+    acceptance_criteria:
+      - "CreateAssetRequest 有 path/content/content_type 验证约束"
+      - "路径穿越字符被 pattern 拒绝"
+      - "list_assets 有分页参数验证"
+      - "≥10 个边界测试用例全部通过"
+    failure_modes:
+      - scenario: "path pattern 过严导致合法路径被拒（如中文路径名）"
+        likelihood: low
+        impact: low
+        mitigation: "pattern 覆盖字母/数字/下划线/连字符/点/斜杠，足够通用"
+    tech_stack:
+      - "pydantic>=2.0.0"
+    test_coverage: "≥10 个边界测试：空值、超长、SQL注入、路径穿越、超大content、分页边界"
+
+  # ================================================================
+  # Wave 4: Market 服务持久化 + 验证加固
+  # ================================================================
+  - id: ohh-4-market-persist
+    title: "Market 服务 SQLite 持久化"
+    description: |
+      1. 创建 market/models.py: Template, Skill, Mcp ORM 模型
+         - Template: id, name, description, category(str: agent/workflow/tool), author, version, tags(JSON), created_at
+         - Skill: id, name, description, category, author, version, tags(JSON), created_at
+         - Mcp: id, name, description, transport(str: sse/streamable-http), endpoint_url, created_at
+      2. 重写 market/service.py: 所有操作改为 async，使用 SQLAlchemy session
+         - list_templates/skills/mcps: SELECT with filter + pagination
+         - get_template: SELECT by id
+      3. 修改 market/main.py: lifespan 中初始化 DB 表 + seed 示例数据
+      4. seed 数据: 与当前内存 _seed() 一致
+    wave: 4
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-db"
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/market/src/ohent_market/service.py"
+        description: "当前 MarketService 内存 list 实现"
+      - path: "OpenHarnessEnterprise/services/market/src/ohent_market/main.py"
+        description: "FastAPI app"
+      - path: "OpenHarnessEnterprise/services/market/src/ohent_market/api/v1/templates.py"
+        description: "Market 端点（templates/skills/mcps）"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 280
+    focus_area: "market/models.py (new), market/service.py, market/main.py"
+    verification:
+      - "GET /internal/market/templates 返回分页结果"
+      - "GET /internal/market/templates?type=agent 按类型过滤"
+      - "GET /internal/market/skills 返回技能列表"
+      - "GET /internal/market/mcps 返回 MCP 列表"
+      - "重启服务后数据持久化"
+    acceptance_criteria:
+      - "Template/Skill/Mcp ORM 模型定义完整"
+      - "list 操作使用 DB 查询 + 分页"
+      - "seed 数据写入 DB"
+      - "重启后数据不丢失"
+    failure_modes:
+      - scenario: "JSON 类型字段在 SQLite 中存储格式问题"
+        likelihood: low
+        impact: low
+        mitigation: "SQLAlchemy JSON 类型在 SQLite 中自动序列化为 text"
+    tech_stack:
+      - "sqlalchemy>=2.0.0"
+      - "aiosqlite"
+    test_coverage: "单元测试：模型创建、列表查询、分页、过滤"
+
+  - id: ohh-4-market-validate
+    title: "Market 输入验证加固 + 边界测试"
+    description: |
+      1. 修改 market/api/v1/templates.py 添加参数验证:
+         - category/type: Query 参数枚举验证（agent/workflow/tool 或 None）
+         - keyword: Field(max_length=200)
+         - page: Field(ge=1), page_size: Field(ge=1, le=100)
+      2. 添加 FastAPI 验证异常处理器
+      3. 新增边界测试: test_market_validation.py
+         - 无效 type 参数 ("invalid_type") → 422
+         - keyword 超长 (300 字符) → 422
+         - page=0 → 422, page=-1 → 422
+         - page_size=0 → 422, page_size=101 → 422
+         - keyword 含特殊字符 (SQL 注入, XSS) — 应正常处理或 422
+         - 空 keyword → 正常返回所有结果
+         - 超大 page (999999) → 返回空列表
+    wave: 4
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-4-market-persist"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/market/src/ohent_market/api/v1/templates.py"
+        description: "当前端点无参数枚举验证"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 200
+    focus_area: "market/api/v1/templates.py, tests/test_market_validation.py"
+    verification:
+      - "无效 type → 422"
+      - "keyword 超长 → 422"
+      - "page=0 → 422"
+      - "所有边界测试通过"
+    acceptance_criteria:
+      - "type 参数有枚举验证"
+      - "keyword 有长度限制"
+      - "分页参数有范围验证"
+      - "≥8 个边界测试用例全部通过"
+    failure_modes: []
+    tech_stack:
+      - "pydantic>=2.0.0"
+      - "fastapi"
+    test_coverage: "≥8 个边界测试：无效枚举、超长keyword、分页边界、特殊字符"
+
+  # ================================================================
+  # Wave 5: Billing 服务持久化 + 验证加固
+  # ================================================================
+  - id: ohh-5-billing-persist
+    title: "Billing 服务 SQLite 持久化"
+    description: |
+      1. 创建 billing/models.py: UsageRecord ORM 模型（id: str PK auto-gen, instance_id: str, instance_name: str, model: str, input_tokens: int, output_tokens: int, cost: float, created_at: datetime）
+      2. 重写 billing/service.py: 所有操作改为 async，使用 SQLAlchemy session
+         - get_summary: SELECT with date filter + GROUP BY aggregation
+         - list_records: SELECT with filters (instance_id, model, start_date, end_date) + pagination
+      3. 修改 billing/main.py: lifespan 中初始化 DB 表 + seed SEED_RECORDS（与当前内存数据一致）
+    wave: 5
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-1-infra-shared-db"
+      - "ohh-1-infra-shared-deps"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/billing/src/ohent_billing/service.py"
+        description: "当前 BillingService 内存实现，含 SEED_RECORDS"
+      - path: "OpenHarnessEnterprise/services/billing/src/ohent_billing/main.py"
+        description: "FastAPI app + lifespan"
+      - path: "OpenHarnessEnterprise/services/billing/src/ohent_billing/api/v1/usage.py"
+        description: "Billing 端点 (summary, records)"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 3
+    estimated_lines: 250
+    focus_area: "billing/models.py (new), billing/service.py, billing/main.py"
+    verification:
+      - "GET /internal/billing/usage/summary 返回聚合结果"
+      - "GET /internal/billing/usage/summary?period=day 按天过滤"
+      - "GET /internal/billing/usage/records 返回分页记录"
+      - "GET /internal/billing/usage/records?instance_id=inst-001 按实例过滤"
+      - "重启服务后数据持久化"
+    acceptance_criteria:
+      - "UsageRecord ORM 模型定义完整"
+      - "get_summary 使用 DB 聚合查询"
+      - "list_records 使用 DB 分页查询"
+      - "5 条 seed records 写入 DB"
+      - "重启后数据不丢失"
+    failure_modes:
+      - scenario: "日期过滤在 SQLite 中格式不一致"
+        likelihood: low
+        impact: medium
+        mitigation: "统一使用 ISO 8601 格式，SQLAlchemy datetime 类型自动处理"
+    tech_stack:
+      - "sqlalchemy>=2.0.0"
+      - "aiosqlite"
+    test_coverage: "单元测试：模型创建、聚合查询、分页、日期过滤"
+
+  - id: ohh-5-billing-validate
+    title: "Billing 输入验证加固 + 边界测试"
+    description: |
+      1. 修改 billing/api/v1/usage.py 添加参数验证:
+         - period: Field(pattern='^(day|week|month|year)$')
+         - page: Field(ge=1), page_size: Field(ge=1, le=100)
+         - instance_id: Field(max_length=128, pattern=r'^[a-zA-Z0-9\-]+$')
+         - start_date / end_date: 使用 datetime 验证格式 (ISO 8601)
+      2. 添加 FastAPI 验证异常处理器
+      3. 新增边界测试: test_billing_validation.py
+         - 无效 period ("invalid") → 422
+         - 空字符串 period → 422 或默认值
+         - page=0 → 422, page=-1 → 422
+         - page_size=0 → 422, page_size=101 → 422
+         - 无效日期格式 ("not-a-date") → 422
+         - instance_id 含 SQL 注入 ("'; DROP TABLE--") → 422
+         - instance_id 超长 (200 字符) → 422
+         - start_date > end_date → 返回空结果（不报错）
+    wave: 5
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-5-billing-persist"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/billing/src/ohent_billing/api/v1/usage.py"
+        description: "当前端点 period 无枚举验证"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 2
+    estimated_lines: 200
+    focus_area: "billing/api/v1/usage.py, tests/test_billing_validation.py"
+    verification:
+      - "无效 period → 422"
+      - "page=0 → 422"
+      - "无效日期 → 422"
+      - "SQL 注入 instance_id → 422"
+      - "所有边界测试通过"
+    acceptance_criteria:
+      - "period 有枚举验证 (day/week/month/year)"
+      - "instance_id 有格式验证"
+      - "日期参数有格式验证"
+      - "≥8 个边界测试用例全部通过"
+    failure_modes:
+      - scenario: "日期解析格式不兼容 SQLite datetime"
+        likelihood: low
+        impact: low
+        mitigation: "使用 Python datetime.fromisoformat() 在应用层验证，不依赖 DB 解析"
+    tech_stack:
+      - "pydantic>=2.0.0"
+      - "fastapi"
+    test_coverage: "≥8 个边界测试：无效枚举、分页边界、日期格式、SQL注入、超长instance_id"
+
+  # ================================================================
+  # Wave 6: 全模块冒烟测试 + 集成验证
+  # ================================================================
+  - id: ohh-6-smoke-auth
+    title: "Auth 服务完整冒烟测试"
+    description: |
+      编写 test_auth_smoke.py，覆盖完整 Auth 链路:
+      1. login → refresh → me 完整流程
+      2. 3 种角色 (admin, org_admin, user) 的权限差异
+      3. 无效 key/过期 token/token 类型错误
+      4. 所有输入验证边界（复用 ohh-2-auth-validate 的测试）
+      5. 验证 422 响应格式统一
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-2-auth-validate"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/tests/test_auth.py"
+        description: "现有 Auth 测试（6 个）"
+      - path: "OpenHarnessEnterprise/services/auth/src/ohent_auth/api/v1/auth.py"
+        description: "Auth 端点路由"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 200
+    focus_area: "tests/test_auth_smoke.py"
+    verification:
+      - "pytest tests/test_auth_smoke.py 全部通过"
+      - "覆盖: 正常流程 + 边界 + 权限 + 验证"
+    acceptance_criteria:
+      - "≥12 个测试用例"
+      - "覆盖 login/refresh/me/logout 4 个端点"
+      - "覆盖 3 种角色权限"
+      - "覆盖所有验证边界"
+      - "所有测试通过"
+    failure_modes: []
+    test_coverage: "冒烟覆盖: 完整流程 + 角色权限 + 输入验证 + 错误码"
+
+  - id: ohh-6-smoke-memory
+    title: "Memory 服务完整冒烟测试"
+    description: |
+      编写 test_memory_smoke.py，覆盖完整 Memory 链路:
+      1. create → get → list → delete 完整 CRUD 流程
+      2. path_prefix 过滤
+      3. 分页参数 (page, page_size) 正常 + 边界
+      4. 所有输入验证边界（复用 ohh-3-memory-validate 的测试）
+      5. 并发创建同 path (UPSERT 行为)
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-3-memory-validate"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/memory/src/ohent_memory/api/v1/assets.py"
+        description: "Memory 端点路由"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 200
+    focus_area: "tests/test_memory_smoke.py"
+    verification:
+      - "pytest tests/test_memory_smoke.py 全部通过"
+      - "覆盖: CRUD + 过滤 + 分页 + 验证"
+    acceptance_criteria:
+      - "≥12 个测试用例"
+      - "覆盖 4 个端点 (create/get/list/delete)"
+      - "覆盖分页和 path 过滤"
+      - "覆盖所有验证边界"
+      - "所有测试通过"
+    failure_modes: []
+    test_coverage: "冒烟覆盖: CRUD 流程 + 过滤 + 分页 + 输入验证 + UPSERT"
+
+  - id: ohh-6-smoke-market
+    title: "Market 服务完整冒烟测试"
+    description: |
+      编写 test_market_smoke.py，覆盖完整 Market 链路:
+      1. list templates/skills/mcps 正常返回
+      2. type/category 过滤
+      3. keyword 搜索
+      4. 分页正常 + 边界
+      5. 所有输入验证边界
+      6. 空搜索结果处理
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-4-market-validate"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/market/src/ohent_market/api/v1/templates.py"
+        description: "Market 端点路由"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 180
+    focus_area: "tests/test_market_smoke.py"
+    verification:
+      - "pytest tests/test_market_smoke.py 全部通过"
+      - "覆盖: 列表 + 过滤 + 搜索 + 分页 + 验证"
+    acceptance_criteria:
+      - "≥10 个测试用例"
+      - "覆盖 templates/skills/mcps 3 个列表端点"
+      - "覆盖过滤和搜索"
+      - "覆盖所有验证边界"
+      - "所有测试通过"
+    failure_modes: []
+    test_coverage: "冒烟覆盖: 列表 + 过滤 + 搜索 + 分页 + 空结果 + 输入验证"
+
+  - id: ohh-6-smoke-billing
+    title: "Billing 服务完整冒烟测试"
+    description: |
+      编写 test_billing_smoke.py，覆盖完整 Billing 链路:
+      1. summary 正常返回 (day/week/month/year)
+      2. records 列表 + 分页
+      3. instance_id/model 过滤
+      4. 日期范围过滤
+      5. 所有输入验证边界
+      6. 无数据期间返回零值
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: medium
+    status: pending
+    dependencies:
+      - "ohh-5-billing-validate"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/services/billing/src/ohent_billing/api/v1/usage.py"
+        description: "Billing 端点路由"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: small
+    estimated_files: 1
+    estimated_lines: 180
+    focus_area: "tests/test_billing_smoke.py"
+    verification:
+      - "pytest tests/test_billing_smoke.py 全部通过"
+      - "覆盖: summary + records + 过滤 + 分页 + 验证"
+    acceptance_criteria:
+      - "≥10 个测试用例"
+      - "覆盖 summary/records 2 个端点"
+      - "覆盖 4 种 period"
+      - "覆盖过滤和日期范围"
+      - "覆盖所有验证边界"
+      - "所有测试通过"
+    failure_modes: []
+    test_coverage: "冒烟覆盖: summary 4种period + records + 过滤 + 日期范围 + 输入验证"
+
+  - id: ohh-6-smoke-integration
+    title: "全链路集成冒烟测试"
+    description: |
+      编写 test_integration_smoke.py，覆盖跨服务链路:
+      1. Gateway → Auth: JWT 认证 + 转发
+      2. Gateway → Memory: 带 JWT 的 asset 操作
+      3. Gateway → Market: 带 JWT 的 template/skill/mcp 查询
+      4. Gateway → Billing: 带 JWT 的 usage 查询
+      5. Gateway → Host: 带 JWT 的 agent 创建
+      6. 无 JWT → 401 拦截
+      7. 过期 JWT → 401 拦截
+      8. 输入验证边界矩阵（空值、超长、注入跨链路传递）
+    wave: 6
+    agent: gem-implementer
+    prototype: false
+    covers: []
+    priority: high
+    status: pending
+    dependencies:
+      - "ohh-6-smoke-auth"
+      - "ohh-6-smoke-memory"
+      - "ohh-6-smoke-market"
+      - "ohh-6-smoke-billing"
+    conflicts_with: []
+    context_files:
+      - path: "OpenHarnessEnterprise/tests/test_e2e_full_chain.py"
+        description: "现有 E2E 全链路测试"
+    planning_pass: 1
+    planning_history:
+      - pass: 1
+        reason: "initial"
+        timestamp: "2026-04-16T00:00:00Z"
+    estimated_effort: medium
+    estimated_files: 1
+    estimated_lines: 250
+    focus_area: "tests/test_integration_smoke.py"
+    verification:
+      - "pytest tests/test_integration_smoke.py 全部通过"
+      - "覆盖 Gateway 到所有后端的完整链路"
+    acceptance_criteria:
+      - "≥15 个测试用例"
+      - "覆盖 Gateway → Auth/Memory/Market/Billing/Host 5 条链路"
+      - "覆盖 JWT 认证和拦截"
+      - "覆盖输入验证跨链路传递"
+      - "所有测试通过"
+      - "pytest tests/ 整体全部通过（无回归）"
+    failure_modes:
+      - scenario: "Gateway 转发时 DB session 生命周期冲突"
+        likelihood: low
+        impact: medium
+        mitigation: "每个服务使用独立的内存 SQLite（测试 fixture）"
+      - scenario: "JWT 签发和验证服务间不一致"
+        likelihood: low
+        impact: high
+        mitigation: "所有服务共享 shared/security.py 的 JWT 配置"
+    test_coverage: "集成冒烟: 5条链路 + JWT拦截 + 验证矩阵 + 回归"
+
+planning_pass: 1
+planning_history:
+  - pass: 1
+    reason: "initial plan creation"
+    timestamp: "2026-04-16T00:00:00Z"
