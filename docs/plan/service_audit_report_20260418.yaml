@@ -1,0 +1,496 @@
+plan_id: service-audit-20260418
+objective: Comprehensive investigation of agent-platform implementation status against require.md and api-protocol.md specifications
+focus_area: full-platform-audit
+created_at: "2026-04-18"
+created_by: gem-researcher
+status: completed
+
+tldr:
+  - Project is PAST skeleton stage: full-chain Gateway → Auth → Scheduler → Host → SDK works with E2E tests
+  - Auth service is the most complete (~80% of spec), Host and Billing are functional (~50%), Market and Scheduler are skeleton-level (~20-30%)
+  - Shared library is solid: models, event bus, security, config, service client all implemented
+  - Major gaps: no Celery tasks, no service discovery, no configuration center, no frontend, event bus unused
+  - Scheduler is currently just a dumb HTTP proxy - the entire orchestration/cross-service-logic layer is missing
+  - Market has zero persistence (in-memory only) and no Agent Config builder (api-protocol §4.3)
+  - No WebSocket streaming, no file/binary upload support in memory service, no rate limiting in gateway
+
+research_metadata:
+  methodology: "Systematic source code reading of all .py files across all 8 service directories + shared library + agents/ + tests/ + migrations + docs. Compared actual endpoints and features against require.md (8 major sections) and api-protocol.md (6 sections, 60+ endpoints)."
+  scope: "Full platform audit - every service directory, shared library, tests, migrations, scripts, docs"
+  confidence: high
+  coverage: 0.92
+  decision_blockers: 0
+  research_blockers: 0
+
+files_analyzed:
+- file: agent-platform/docs/require.md
+  path: agent-platform/docs/require.md
+  purpose: Full specification document (8 sections)
+  key_elements:
+  - element: Section 1-8
+    type: specification
+    location: require.md:1-800
+    description: Defines all services, architecture, tech stack, API routes, data models
+  language: markdown
+  lines: ~800
+
+- file: agent-platform/docs/api-protocol.md
+  path: agent-platform/docs/api-protocol.md
+  purpose: API contract definition
+  key_elements:
+  - element: Route table + 60+ endpoint definitions
+    type: specification
+    location: api-protocol.md:1-500
+    description: Full HTTP API contract with request/response formats, error codes, data models
+  language: markdown
+  lines: ~500
+
+- file: agent-platform/services/shared/src/agentp_shared/models.py
+  path: agent-platform/services/shared/src/agentp_shared/models.py
+  purpose: SQLAlchemy ORM models for all tables
+  key_elements:
+  - element: Organization, User, ApiKey, AgentInstance, UsageRecord, MemoryAsset, BillingRule, TaskRecord
+    type: class
+    location: models.py:1-300
+    description: Complete ORM models with proper FKs, indexes, and JSONB columns
+  language: python
+  lines: ~300
+
+- file: agent-platform/services/shared/src/agentp_shared/event_bus.py
+  path: agent-platform/services/shared/src/agentp_shared/event_bus.py
+  purpose: Redis Streams event bus
+  key_elements:
+  - element: EventBus class with publish/subscribe/consume
+    type: class
+    location: event_bus.py:1-150
+    description: Full Redis Streams implementation with consumer groups, but UNUSED by any service
+  language: python
+  lines: ~150
+
+- file: agent-platform/services/auth/src/agentp_auth/service.py
+  path: agent-platform/services/auth/src/agentp_auth/service.py
+  purpose: Auth service business logic
+  key_elements:
+  - element: login, refresh, logout, authenticate_api_key
+    type: function
+    location: service.py:70-200
+    description: Full JWT auth flow with Redis blacklist and refresh token management
+  - element: create/list/revoke_api_key, create_organization, get_org_tree, list_org_members
+    type: function
+    location: service.py:300-700
+    description: Organization, user, and API key management
+  language: python
+  lines: ~700
+
+- file: agent-platform/services/host/src/agentp_host/service.py
+  path: agent-platform/services/host/src/agentp_host/service.py
+  purpose: Host service with SDK integration
+  key_elements:
+  - element: HostService class
+    type: class
+    location: service.py:1-150
+    description: OrchestratorClient wrapper (noop runtime) with create/list/get/destroy/send_message
+  - element: sync_create_to_db, sync_destroy_in_db, list_instances_from_db
+    type: function
+    location: service.py:150-250
+    description: PostgreSQL sync for instance records
+  language: python
+  lines: ~250
+
+- file: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py
+  path: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py
+  purpose: Scheduler as HTTP proxy
+  key_elements:
+  - element: ROUTE_TABLE + proxy_request
+    type: variable/function
+    location: proxy.py:1-100
+    description: Simple prefix-based request forwarding, NO business logic
+  language: python
+  lines: ~100
+
+- file: agent-platform/services/market/src/agentp_market/service.py
+  path: agent-platform/services/market/src/agentp_market/service.py
+  purpose: Market service (in-memory only)
+  key_elements:
+  - element: MarketService with hardcoded seed data
+    type: class
+    location: service.py:1-150
+    description: In-memory templates/skills/mcps lists with filter/pagination, NO database
+  language: python
+  lines: ~150
+
+- file: agent-platform/services/billing/src/agentp_billing/service.py
+  path: agent-platform/services/billing/src/agentp_billing/service.py
+  purpose: Billing service with PostgreSQL
+  key_elements:
+  - element: create_usage_record, get_summary, list_records
+    type: function
+    location: service.py:1-200
+    description: Usage records with aggregation queries (by_model, daily_trend)
+  language: python
+  lines: ~200
+
+- file: agent-platform/services/memory/src/agentp_memory/service.py
+  path: agent-platform/services/memory/src/agentp_memory/service.py
+  purpose: Memory service with PostgreSQL
+  key_elements:
+  - element: create_asset, get_asset, list_assets, delete_asset
+    type: function
+    location: service.py:1-150
+    description: Path-based asset CRUD with content stored in JSONB metadata_
+  language: python
+  lines: ~150
+
+- file: agent-platform/services/gateway/src/agentp_gateway/middleware.py
+  path: agent-platform/services/gateway/src/agentp_gateway/middleware.py
+  purpose: Gateway middleware
+  key_elements:
+  - element: GatewayMiddleware
+    type: class
+    location: middleware.py:1-120
+    description: JWT auth + request forwarding to scheduler, no rate limiting
+  language: python
+  lines: ~120
+
+- file: agent-platform/agents/openharness/adapter.py
+  path: agent-platform/agents/openharness/adapter.py
+  purpose: OpenHarness agent adapter
+  key_elements:
+  - element: OpenHarnessAdapter (build_exec_argv, build_exec_env)
+    type: class
+    location: adapter.py:1-60
+    description: Implements AgentAdapter protocol for oh CLI invocations
+  language: python
+  lines: ~60
+
+- file: agent-platform/alembic/versions/001_initial_models.py
+  path: agent-platform/alembic/versions/001_initial_models.py
+  purpose: Initial database migration
+  key_elements:
+  - element: All 8 tables with indexes and constraints
+    type: migration
+    location: 001_initial_models.py:1-200
+    description: Complete DDL for organizations, users, api_keys, agent_instances, usage_records, memory_assets, billing_rules, task_records
+  language: python
+  lines: ~200
+
+patterns_found:
+- category: architecture
+  pattern: Star topology with proxy-based scheduler
+  description: "Gateway → Scheduler (dumb proxy) → Backend services. Scheduler currently does zero business orchestration."
+  examples:
+  - file: scheduler/proxy.py
+    location: proxy.py:8-16
+    snippet: "ROUTE_TABLE: dict[str, tuple[str, str]] = { ... }"
+  prevalence: common
+
+- category: structure
+  pattern: Internal API prefix convention
+  description: "All backend services expose /internal/{service}/* endpoints, scheduler maps /api/v1/{service} → /internal/{service}"
+  examples:
+  - file: scheduler/proxy.py
+    location: proxy.py:8-16
+    snippet: '"/api/v1/auth": (AUTH_URL, "/internal/auth")'
+  prevalence: common
+
+- category: error_handling
+  pattern: Service-specific error exception + error_response
+  description: "Each service defines its own Error exception (AuthError, HostError, BillingError, MemoryError) with code/message/status_code"
+  examples:
+  - file: auth/service.py
+    location: service.py:30-40
+    snippet: "class AuthError(Exception): def __init__(self, code, message, ...)"
+  prevalence: common
+
+- category: structure
+  pattern: Seed data on startup
+  description: "Services seed default data during lifespan startup (auth seeds root org + admin user, memory seeds sample assets, billing seeds usage records)"
+  examples:
+  - file: auth/main.py
+    location: main.py:11-13
+    snippet: "async with async_session_factory() as db: await service.seed_default_data(db)"
+  prevalence: common
+
+- category: structure
+  pattern: Singleton service instance per module
+  description: "Services use module-level singleton (_service = None, get_service() returns or creates)"
+  examples:
+  - file: host/api/v1/agents.py
+    location: agents.py:15-20
+    snippet: "_service: HostService | None = None; def get_service() -> HostService: ..."
+  prevalence: common
+
+- category: data_access
+  pattern: Direct DB access per service (no shared data proxy)
+  description: "Each service connects directly to PostgreSQL via shared db.py factory. Memory service is NOT a general DB proxy per require.md §9.1.2."
+  examples:
+  - file: shared/db.py
+    location: db.py:1-15
+    snippet: "engine = create_async_engine(db_settings.url, ...)"
+  prevalence: universal
+
+related_architecture:
+  components_relevant_to_domain:
+  - component: Gateway
+    responsibility: JWT auth validation, request forwarding to scheduler, request_id generation
+    location: services/gateway/src/agentp_gateway/
+    relationship_to_domain: "Entry point for all external requests"
+  - component: Scheduler
+    responsibility: HTTP proxy (currently), should be BFF orchestrator
+    location: services/scheduler/src/agentp_scheduler/
+    relationship_to_domain: "Central routing hub - currently stateless proxy only"
+  - component: Auth Service
+    responsibility: API Key auth, JWT lifecycle, org/user/key management
+    location: services/auth/src/agentp_auth/
+    relationship_to_domain: "Most complete service, handles auth + org management"
+  - component: Host Service
+    responsibility: Agent instance lifecycle via SDK (noop runtime)
+    location: services/host/src/agentp_host/
+    relationship_to_domain: "SDK integration point, manages agent instances"
+  - component: Memory Service
+    responsibility: Path-based asset storage
+    location: services/memory/src/agentp_memory/
+    relationship_to_domain: "PostgreSQL-backed KV store for text content"
+  - component: Market Service
+    responsibility: Template/Skill/MCP browsing
+    location: services/market/src/agentp_market/
+    relationship_to_domain: "In-memory read-only skeleton, no persistence"
+  - component: Billing Service
+    responsibility: Usage records, cost aggregation
+    location: services/billing/src/agentp_billing/
+    relationship_to_domain: "PostgreSQL-backed usage tracking"
+  - component: Shared Library
+    responsibility: Models, errors, event bus, security, config, service client
+    location: services/shared/src/agentp_shared/
+    relationship_to_domain: "Foundation used by all services"
+  interfaces_used_by_domain:
+  - interface: FastAPI Router
+    location: each service/api/v1/
+    usage_pattern: "Each service defines APIRouter with /internal/{service} prefix"
+  data_flow_involving_domain: "External Request → Gateway (JWT check) → Scheduler (proxy) → Backend Service (business logic) → PostgreSQL"
+  key_relationships_to_domain:
+  - from: Gateway
+    to: Scheduler
+    relationship: "HTTP forward (all /api/v1/* routes)"
+  - from: Scheduler
+    to: Auth/Host/Memory/Market/Billing
+    relationship: "HTTP proxy (prefix-based routing)"
+  - from: All services
+    to: Shared Library
+    relationship: "imports (models, config, db, security)"
+
+related_technology_stack:
+  languages_used_in_domain:
+  - Python 3.11+
+  frameworks_used_in_domain:
+  - name: FastAPI
+    usage_in_domain: All 7 services use FastAPI for HTTP endpoints
+  - name: SQLAlchemy 2.0 (async)
+    usage_in_domain: ORM models, async engine, migrations
+  - name: Alembic
+    usage_in_domain: Database migrations (1 migration)
+  - name: agent-orchestrator SDK
+    usage_in_domain: Host service uses OrchestratorClient (noop runtime)
+  libraries_used_in_domain:
+  - name: PyJWT
+    purpose_in_domain: JWT token creation/decoding
+  - name: httpx
+    purpose_in_domain: Inter-service HTTP calls and gateway forwarding
+  - name: redis.asyncio
+    purpose_in_domain: Token blacklist, event bus (defined but unused)
+  - name: pydantic / pydantic-settings
+    purpose_in_domain: Request/response models and configuration
+  - name: asyncpg
+    purpose_in_domain: PostgreSQL async driver
+
+related_conventions:
+  naming_patterns_in_domain: "Service packages: agentp_{name}. Internal routes: /internal/{name}/*. Models in shared/models.py. Settings per-service via pydantic-settings with ENV_PREFIX."
+  structure_of_domain: "Each service: src/agentp_{name}/ with main.py, service.py, api/v1/, config.py, schemas.py (optional). Tests in top-level tests/ directory."
+  error_handling_in_domain: "Service-specific error exceptions (AuthError, HostError, etc.) mapped to error codes. OHError/error_response from shared lib. JSONResponse with error body."
+  testing_in_domain: "pytest with conftest.py. Per-service health + unit tests. E2E full-chain test. Mark: @pytest.mark.e2e"
+  documentation_in_domain: "require.md (full spec), api-protocol.md (API contract), PRD.yaml (project tracking)"
+
+related_dependencies:
+  internal:
+  - component: agentp_shared
+    relationship_to_domain: "All services depend on it for models, config, db, security"
+    direction: inbound
+  - component: agent-orchestrator (SDK submodule)
+    relationship_to_domain: "Host service imports OrchestratorClient and contracts"
+    direction: inbound
+  external:
+  - name: PostgreSQL 16
+    purpose_for_domain: "Primary database for all structured data"
+  - name: Redis 7
+    purpose_for_domain: "Token blacklist, event bus (unused), Celery broker (not configured)"
+
+domain_security_considerations:
+  sensitive_areas:
+  - area: JWT secret key
+    location: shared/config.py:33
+    concern: "Hardcoded default: 'agentp-dev-secret-key-change-in-production' - must override via AGENTP_JWT_SECRET_KEY env var"
+  - area: API Key hashing
+    location: auth/service.py:42-44
+    concern: "SHA-256 hash used for storage - appropriate, not reversible"
+  - area: Admin API key
+    location: auth/service.py:660-680
+    concern: "Default admin key 'oh-admin-key-default' seeded on startup - must be changed for production"
+  - area: No RBAC enforcement
+    location: auth/api/v1/auth.py
+    concern: "Endpoints do not check user role/permissions - any valid JWT can access any endpoint"
+  authentication_patterns_in_domain: "API Key → JWT exchange. JWT validated at gateway. X-Internal-Call header for service-to-service."
+  authorization_patterns_in_domain: "Token payload contains role/permissions but NO enforcement middleware exists"
+  data_validation_in_domain: "Pydantic schemas for request validation. SQLAlchemy for DB constraints."
+
+testing_patterns:
+  framework: pytest
+  coverage_areas:
+  - "Service health endpoints (7 test files)"
+  - "Auth service unit tests"
+  - "Host service unit tests"
+  - "Memory service unit tests"
+  - "Market service unit tests"
+  - "Billing service unit tests"
+  - "Scheduler proxy tests"
+  - "Shared library tests (models, event bus, API mapping)"
+  - "SDK noop tests"
+  - "Full-chain E2E test"
+  - "Integration tests"
+  test_organization: "Top-level tests/ directory with conftest.py. test_{service}.py for unit tests. test_health_{service}.py for health checks."
+  mock_patterns:
+  - "AsyncSession mocking for DB tests"
+  - "httpx mock for inter-service calls"
+
+open_questions:
+- question: "Should the scheduler remain a pure proxy or evolve into a BFF with business orchestration?"
+  context: "require.md §6 describes scheduler as 'central nervous system' with approval workflows, lifecycle management, config center. Current implementation is a dumb proxy."
+  type: decision_blocker
+  affects: ["scheduler-refactor", "approval-workflow", "lifecycle-management"]
+- question: "Should market service persist to PostgreSQL or stay in-memory?"
+  context: "Market is currently in-memory with hardcoded data. api-protocol §4.3 defines a full Agent Config builder with versioning, publishing, import/export."
+  type: decision_blocker
+  affects: ["market-persistence", "agent-config-builder"]
+- question: "When should Celery be integrated?"
+  context: "require.md §6.4 describes Celery for async tasks (idle recycling, billing reports, health checks). PRD marks it as out-of-scope for skeleton stage."
+  type: decision_blocker
+  affects: ["celery-integration", "scheduled-tasks", "async-operations"]
+- question: "Should event bus be activated immediately?"
+  context: "EventBus is fully implemented in shared but no service publishes or subscribes to events."
+  type: research
+  affects: ["event-bus-activation", "host-event-publishing", "billing-event-consumption"]
+- question: "Is rate limiting needed before production?"
+  context: "require.md §7.4 defines multi-dimensional rate limiting. PRD marks it out-of-scope for skeleton."
+  type: nice_to_know
+  affects: ["gateway-rate-limiting"]
+
+gaps:
+# ==========================================================================
+# CRITICAL GAPS (blocks core functionality)
+# ==========================================================================
+- area: Scheduler - No business orchestration
+  description: "Scheduler is a dumb HTTP proxy. Missing: service discovery, approval workflow, instance lifecycle management, configuration center, task scheduling. require.md §6.1-6.7 describes all of these."
+  impact: decision_blocker
+  affects: ["scheduler-refactor", "approval-workflow", "config-center"]
+
+- area: Celery - Not integrated
+  description: "No tasks.py or beat_schedule.py exists. require.md §9.1.1 defines Celery for async/scheduled tasks (idle recycling, billing reports, health checks). PRD out_of_scope for skeleton, but needed for Phase 2+."
+  impact: decision_blocker
+  affects: ["celery-integration", "scheduled-tasks"]
+
+- area: Market - No database persistence
+  description: "Market service uses in-memory lists with hardcoded seed data. No PostgreSQL tables for templates/skills/mcps. Data lost on restart."
+  impact: decision_blocker
+  affects: ["market-persistence", "market-tables"]
+
+- area: Agent Config Builder - Completely missing
+  description: "api-protocol §4.3 defines 11 endpoints for Agent Config CRUD, versioning, publishing, importing, exporting, validation, preview. None implemented. This is a major feature for enterprise users."
+  impact: decision_blocker
+  affects: ["agent-config-builder", "market-service"]
+
+# ==========================================================================
+# HIGH PRIORITY GAPS (important features missing)
+# ==========================================================================
+- area: Event Bus - Implemented but unused
+  description: "EventBus with Redis Streams is fully coded in shared/event_bus.py but NO service imports or initializes it. No agent.created, agent.destroyed, agent.usage events are published or consumed."
+  impact: research_blocker
+  affects: ["event-bus-activation", "host-events", "billing-events"]
+
+- area: RBAC - No enforcement
+  description: "JWT payload contains role and permissions, but no middleware or decorator enforces them. Any authenticated user can access any endpoint including admin-only operations."
+  impact: research_blocker
+  affects: ["rbac-enforcement", "auth-middleware"]
+
+- area: Host - Missing advanced operations
+  description: "Missing per api-protocol §4.2: restart, batch-restart, batch-destroy, command execution, skill installation, MCP configuration, config modification, monitor data, memory sync (upload/download/tree). Currently only basic CRUD + send_message."
+  impact: research_blocker
+  affects: ["host-advanced-ops", "skill-management", "mcp-management"]
+
+- area: Billing - Missing budget and export
+  description: "Missing per api-protocol §4.5: budget management (GET/PUT /billing/budget), CSV export (GET /billing/export), alert rules. BillingRule model exists but no API to manage rules. Cost calculation is hardcoded, not rule-driven."
+  impact: research_blocker
+  affects: ["billing-budget", "billing-export", "billing-rules-api"]
+
+- area: Memory - No binary/file support
+  description: "Memory service stores content in JSONB metadata_ column. No file system or object storage integration. Missing: multipart upload (PUT), keyword search (GET /search), file streaming, binary content support."
+  impact: research_blocker
+  affects: ["memory-binary", "memory-search", "memory-storage"]
+
+- area: Auth - Missing member management endpoints
+  description: "Missing per api-protocol §4.6: POST org/{id}/members (add member), DELETE org/{id}/members/{user_id} (remove), PUT org/{id}/members/{user_id} (modify role), POST api-keys/{key_id}/renew, GET /permissions, GET /roles, PUT /roles/{id}."
+  impact: research_blocker
+  affects: ["auth-member-mgmt", "auth-role-mgmt"]
+
+- area: Gateway - No rate limiting
+  description: "require.md §7.4 defines multi-dimensional rate limiting (global, org-level, user-level, endpoint-level). Not implemented. PRD marks out-of-scope for skeleton."
+  impact: nice_to_know
+  affects: ["gateway-rate-limiting"]
+
+# ==========================================================================
+# MEDIUM PRIORITY GAPS (nice-to-have features)
+# ==========================================================================
+- area: Gateway - No CORS middleware
+  description: "require.md §7.1 mentions CORS. Not configured in gateway."
+  impact: nice_to_know
+  affects: ["gateway-cors"]
+
+- area: Gateway - No request logging/audit
+  description: "require.md §7.5 requires full request logging and audit trail. Not implemented."
+  impact: nice_to_know
+  affects: ["gateway-audit"]
+
+- area: Gateway - No WebSocket support
+  description: "require.md §7.1 reserves WebSocket for streaming. api-protocol §1.6 defines ws:// endpoint. Not implemented. PRD out_of_scope."
+  impact: nice_to_know
+  affects: ["gateway-websocket"]
+
+- area: Frontend - Not implemented
+  description: "No frontend/ directory exists. PRD marks frontend as out_of_scope for current phase."
+  impact: nice_to_know
+  affects: ["frontend-implementation"]
+
+- area: Service discovery - Hardcoded URLs
+  description: "Service URLs hardcoded in shared/config.py. No dynamic registration/health check/auto-removal."
+  impact: nice_to_know
+  affects: ["service-discovery"]
+
+- area: Process pool model - Not implemented for Host
+  description: "require.md §9.3.2 describes multi-process worker pool with independent OrchestratorClient per worker. Current host runs single-process."
+  impact: nice_to_know
+  affects: ["host-process-pool"]
+
+- area: Memory service - No search endpoint
+  description: "api-protocol §4.8 defines GET /memory/search with keyword filtering. Not implemented."
+  impact: nice_to_know
+  affects: ["memory-search"]
+
+# ==========================================================================
+# SERVICE-BY-SERVICE SUMMARY
+# ==========================================================================
+# shared:    ████████████████████ 95% - Complete, only unused event bus
+# auth:      ██████████████████░░ 80% - Missing member/role management, no RBAC enforcement
+# host:      ██████████████░░░░░░ 55% - Basic CRUD + send_message, missing advanced ops
+# billing:   ██████████████░░░░░░ 50% - Records + summary, missing budget/export/rules
+# memory:    █████████████░░░░░░░ 45% - Basic CRUD, no binary/search/storage
+# gateway:   ████████████░░░░░░░░ 40% - JWT + forwarding, no rate limit/CORS/audit
+# scheduler: ██████░░░░░░░░░░░░░░ 20% - Dumb proxy only, no orchestration
+# market:    ████░░░░░░░░░░░░░░░░ 15% - In-memory skeleton, no persistence, no builder

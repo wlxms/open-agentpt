@@ -1,0 +1,368 @@
+plan_id: service_persistence_audit
+objective: Determine which agent-platform services use PostgreSQL vs in-memory data
+focus_area: agent-platform/services
+created_at: "2026-04-18T00:00:00Z"
+created_by: gem-researcher
+status: completed
+
+tldr: |
+  - **auth** and **memory** are fully DB-backed (SQLAlchemy async, Depends(get_db)).
+  - **billing**, **market**, and **host** are 100% in-memory (dict/list singletons, no DB imports).
+  - **scheduler** is a pure proxy layer (no data store of its own), with a trivial in-memory `_tasks` dict for task status stubs.
+  - **gateway** is a pure reverse-proxy (JWT validation + forwarding to scheduler), zero data persistence.
+  - Shared models.py defines 7 DB tables (Organization, User, ApiKey, AgentInstance, UsageRecord, MemoryAsset, BillingRule, TaskRecord) — only auth+memory use them currently.
+  - billing and market have NO schemas.py files; host uses `CreateAgentRequest` from shared/api_mapping.py.
+
+research_metadata:
+  methodology: "Direct file reads of all service.py, main.py, and API route files across 7 service directories; grep for get_db/AsyncSession/Depends patterns; verification of shared/models.py ORM definitions"
+  scope: "All 7 services under agent-platform/services/ + shared models"
+  confidence: high
+  coverage: 100
+  decision_blockers: 0
+  research_blockers: 0
+
+files_analyzed:
+- file: models.py
+  path: agent-platform/services/shared/src/agentp_shared/models.py
+  purpose: Defines all SQLAlchemy ORM models for the platform
+  key_elements:
+  - element: Organization
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:28
+    description: Table "organizations" — id, name, parent_id, level, plan, status, timestamps. Self-referential FK for hierarchy.
+  - element: User
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:69
+    description: Table "users" — id, org_id FK, username, email, hashed_password, role, status, timestamps.
+  - element: ApiKey
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:101
+    description: Table "api_keys" — id, org_id FK, user_id FK, name, key_hash, key_prefix, permissions JSON, expires_at, status.
+  - element: AgentInstance
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:148
+    description: Table "agent_instances" — id, org_id FK, user_id FK, name, agent_type, status, model, config JSON, host_node, workspace_root, timestamps.
+  - element: UsageRecord
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:189
+    description: Table "usage_records" — autoincrement id, instance_id FK, org_id FK, model, input_tokens, output_tokens, total_tokens, cost, timestamp.
+  - element: MemoryAsset
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:226
+    description: Table "memory_assets" — id, org_id FK, path, content_type, size_bytes, storage_ref, metadata_ JSON, timestamps.
+  - element: BillingRule
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:260
+    description: Table "billing_rules" — id, org_id FK, model, price_per_input_token, price_per_output_token, effective_from/until.
+  - element: TaskRecord
+    type: class
+    location: agent-platform/services/shared/src/agentp_shared/models.py:293
+    description: Table "task_records" — id, type, status, payload JSON, result JSON, error_message, priority, max_retries, retry_count, scheduled_at, started_at, completed_at.
+  language: Python
+  lines: 330
+
+- file: service.py
+  path: agent-platform/services/billing/src/agentp_billing/service.py
+  purpose: Billing service — usage summaries and record listing
+  key_elements:
+  - element: BillingService
+    type: class
+    location: agent-platform/services/billing/src/agentp_billing/service.py:28
+    description: In-memory service. Constructor takes `list[dict]`, stores in `self._records`. Has get_summary() and list_records() methods with Python-side filtering/pagination.
+  - element: SEED_RECORDS
+    type: variable
+    location: agent-platform/services/billing/src/agentp_billing/service.py:11
+    description: Hardcoded list of 5 usage records (rec-001..rec-005) with fixed timestamps, models, token counts.
+  - element: _calc_cost
+    type: function
+    location: agent-platform/services/billing/src/agentp_billing/service.py:7
+    description: Hardcoded pricing: input $0.00001/token, output $0.00003/token. Ignores BillingRule table entirely.
+  - element: init_billing / get_billing_service
+    type: function
+    location: agent-platform/services/billing/src/agentp_billing/service.py:142
+    description: Global singleton pattern via module-level `_service` variable.
+  language: Python
+  lines: 152
+
+- file: usage.py
+  path: agent-platform/services/billing/src/agentp_billing/api/v1/usage.py
+  purpose: Billing API routes — GET summary and records
+  key_elements:
+  - element: summary()
+    type: function
+    location: agent-platform/services/billing/src/agentp_billing/api/v1/usage.py:14
+    description: GET /internal/billing/usage/summary — calls service singleton, no Depends(get_db).
+  - element: records()
+    type: function
+    location: agent-platform/services/billing/src/agentp_billing/api/v1/usage.py:22
+    description: GET /internal/billing/usage/records — calls service singleton, no Depends(get_db). No Pydantic request model.
+  language: Python
+  lines: 46
+
+- file: service.py
+  path: agent-platform/services/market/src/agentp_market/service.py
+  purpose: Market service — templates, skills, MCP servers listing
+  key_elements:
+  - element: MarketService
+    type: class
+    location: agent-platform/services/market/src/agentp_market/service.py:8
+    description: In-memory service. `self._templates`, `self._skills`, `self._mcps` are plain lists populated by _seed(). Has list_templates, get_template, list_skills, list_mcps.
+  - element: _seed()
+    type: function
+    location: agent-platform/services/market/src/agentp_market/service.py:97
+    description: Hardcodes 3 templates (tpl-001..003), 2 skills (skill-001,002), 1 MCP (mcp-001).
+  - element: list_response
+    type: function
+    location: agent-platform/services/market/src/agentp_market/service.py:88
+    description: Helper for paginated dict responses.
+  language: Python
+  lines: 133
+
+- file: templates.py
+  path: agent-platform/services/market/src/agentp_market/api/v1/templates.py
+  purpose: Market API routes — GET templates, skills, mcps
+  key_elements:
+  - element: list_templates()
+    type: function
+    location: agent-platform/services/market/src/agentp_market/api/v1/templates.py:29
+    description: GET /internal/market/templates — global singleton, no Depends(get_db).
+  - element: get_template()
+    type: function
+    location: agent-platform/services/market/src/agentp_market/api/v1/templates.py:44
+    description: GET /internal/market/templates/{template_id} — linear scan of in-memory list.
+  - element: list_skills / list_mcps
+    type: function
+    location: agent-platform/services/market/src/agentp_market/api/v1/templates.py:58
+    description: GET /internal/market/skills and /internal/market/mcps — read-only list endpoints.
+  language: Python
+  lines: 76
+
+- file: service.py
+  path: agent-platform/services/host/src/agentp_host/service.py
+  purpose: Host service — agent instance CRUD via orchestrator SDK
+  key_elements:
+  - element: HostService
+    type: class
+    location: agent-platform/services/host/src/agentp_host/service.py:8
+    description: Wraps OrchestratorClient with InstanceMapper. Creates temp_dir for workspace. OrchestratorClient uses its OWN SQLite db_path (instances.db), NOT the platform PostgreSQL.
+  - element: create_instance / list_instances / get_instance / destroy_instance / send_message
+    type: function
+    location: agent-platform/services/host/src/agentp_host/service.py:15
+    description: CRUD operations delegated to OrchestratorClient. No reference to shared UsageRecord or AgentInstance models.
+  language: Python
+  lines: 57
+
+- file: agents.py
+  path: agent-platform/services/host/src/agentp_host/api/v1/agents.py
+  purpose: Host API routes — CRUD for agent instances
+  key_elements:
+  - element: create_agent()
+    type: function
+    location: agent-platform/services/host/src/agentp_host/api/v1/agents.py:20
+    description: POST /internal/agents — uses CreateAgentRequest from shared/api_mapping.py. No Depends(get_db).
+  - element: list_agents / get_agent / destroy_agent / send_message
+    type: function
+    location: agent-platform/services/host/src/agentp_host/api/v1/agents.py:15
+    description: Standard CRUD, all via global HostService singleton.
+  language: Python
+  lines: 46
+
+- file: proxy.py
+  path: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py
+  purpose: Scheduler proxy — routes requests to backend services
+  key_elements:
+  - element: proxy_request()
+    type: function
+    location: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py:16
+    description: HTTP reverse proxy. Matches path prefix to ROUTE_TABLE (auth→AUTH_URL, agents→HOST_URL, etc.), forwards with httpx.
+  - element: ROUTE_TABLE
+    type: variable
+    location: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py:10
+    description: Maps /api/v1/* prefixes to (backend_url, internal_prefix) tuples for 5 services.
+  - element: _tasks
+    type: variable
+    location: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py:21
+    description: In-memory dict for task status stubs. get_task_status returns "completed" for unknown tasks.
+  - element: get_task_status()
+    type: function
+    location: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py:56
+    description: Trivial stub — no real task queue or persistence.
+  language: Python
+  lines: 65
+
+- file: middleware.py
+  path: agent-platform/services/gateway/src/agentp_gateway/middleware.py
+  purpose: Gateway middleware — JWT auth + request forwarding
+  key_elements:
+  - element: GatewayMiddleware
+    type: class
+    location: agent-platform/services/gateway/src/agentp_gateway/middleware.py:25
+    description: BaseHTTPMiddleware. Validates JWT via decode_token, injects user_id/org_id/role into request.state, forwards ALL requests to SCHEDULER_URL.
+  - element: PUBLIC_PATHS
+    type: variable
+    location: agent-platform/services/gateway/src/agentp_gateway/middleware.py:18
+    description: Set of paths that skip JWT: /health, /api/v1/auth/login, /docs, /openapi.json.
+  language: Python
+  lines: 140
+
+patterns_found:
+- category: architecture
+  pattern: Global singleton service (module-level _service variable)
+  description: "billing, market, host all use a module-level `_service: XxxService | None` with a `get_service()` accessor. No DI, no Depends(get_db)."
+  examples:
+  - file: agent-platform/services/billing/src/agentp_billing/service.py
+    location: "service.py:142-152"
+    snippet: "_service: BillingService | None = None\ndef init_billing(...): global _service; _service = BillingService(...)\ndef get_billing_service() -> BillingService: ..."
+  - file: agent-platform/services/market/src/agentp_market/api/v1/templates.py
+    location: "templates.py:13-22"
+    snippet: "_service: MarketService | None = None\ndef get_service() -> MarketService: global _service; ..."
+  - file: agent-platform/services/host/src/agentp_host/api/v1/agents.py
+    location: "agents.py:13-20"
+    snippet: "_service: HostService | None = None\ndef get_service() -> HostService: ..."
+  prevalence: common
+
+- category: architecture
+  pattern: Proxy layer pattern (scheduler + gateway)
+  description: "scheduler is a pure HTTP proxy routing /api/v1/* to backend /internal/* endpoints. gateway is a pure reverse-proxy adding JWT auth before forwarding everything to scheduler."
+  examples:
+  - file: agent-platform/services/scheduler/src/agentp_scheduler/proxy.py
+    location: "proxy.py:10-21"
+    snippet: "ROUTE_TABLE: dict[str, tuple[str, str]] = {\"/api/v1/auth\": (AUTH_URL, \"/internal/auth\"), ...}"
+  - file: agent-platform/services/gateway/src/agentp_gateway/middleware.py
+    location: "middleware.py:67-70"
+    snippet: "return await self._forward_to_scheduler(request, request_id, payload)"
+  prevalence: common
+
+- category: architecture
+  pattern: Hardcoded seed data instead of DB
+  description: "billing has SEED_RECORDS (5 usage dicts), market has _seed() (3 templates, 2 skills, 1 MCP). Both are initialized at startup and never written to."
+  examples:
+  - file: agent-platform/services/billing/src/agentp_billing/service.py
+    location: "service.py:11-51"
+    snippet: "SEED_RECORDS = [{\"id\": \"rec-001\", \"time\": \"2026-04-15T10:30:00Z\", ...}, ...]"
+  - file: agent-platform/services/market/src/agentp_market/service.py
+    location: "service.py:97-133"
+    snippet: "def _seed(self) -> None: self._templates = [{\"id\": \"tpl-001\", ...}]"
+  prevalence: common
+
+- category: architecture
+  pattern: Host uses OrchestratorClient with its own SQLite
+  description: "HostService wraps agent-orchestrator's OrchestratorClient which uses a local SQLite file (instances.db) in a temp directory. This is completely separate from the platform PostgreSQL database."
+  examples:
+  - file: agent-platform/services/host/src/agentp_host/service.py
+    location: "service.py:14"
+    snippet: "self.client = OrchestratorClient(allowed_roots=[self.temp_dir], runtime=\"noop\", db_path=str(Path(self.temp_dir) / \"instances.db\"))"
+  prevalence: rare
+
+related_architecture:
+  components_relevant_to_domain:
+  - component: shared/models.py
+    responsibility: Defines 8 SQLAlchemy ORM tables (Organization, User, ApiKey, AgentInstance, UsageRecord, MemoryAsset, BillingRule, TaskRecord)
+    location: agent-platform/services/shared/src/agentp_shared/models.py
+    relationship_to_domain: "All services should ideally use these models. Currently only auth (Organization, User, ApiKey) and memory (MemoryAsset) do."
+  - component: agent-orchestrator (OrchestratorClient)
+    responsibility: Manages agent instance lifecycle via SDK
+    location: agent-platform/agent-orchestrator/src/
+    relationship_to_domain: "host service delegates to this; it uses its own SQLite, not platform DB"
+  interfaces_used_by_domain:
+  - interface: Depends(get_db) → AsyncSession
+    location: agent-platform/services/shared/src/agentp_shared/db.py
+    usage_pattern: "Used by auth and memory. NOT used by billing, market, host, scheduler, gateway."
+  data_flow_involving_domain: |
+    Client → Gateway (JWT auth) → Scheduler (proxy) → Backend Service → PostgreSQL
+    billing/market break this flow: they don't touch PostgreSQL at all.
+    host breaks differently: it writes to OrchestratorClient's own SQLite instead.
+  key_relationships_to_domain:
+  - from: gateway
+    to: scheduler
+    relationship: forwards all requests via HTTP
+  - from: scheduler
+    to: auth, billing, market, memory, host
+    relationship: proxies /api/v1/* to /internal/* via HTTP
+  - from: host
+    to: agent-orchestrator
+    relationship: composes OrchestratorClient for instance CRUD
+
+related_technology_stack:
+  languages_used_in_domain:
+  - Python
+  frameworks_used_in_domain:
+  - name: FastAPI
+    usage_in_domain: All services use FastAPI for HTTP endpoints
+  - name: SQLAlchemy
+    usage_in_domain: ORM models defined in shared/models.py; only auth and memory actually use async sessions
+  libraries_used_in_domain:
+  - name: httpx
+    purpose_in_domain: HTTP client for proxy forwarding (scheduler, gateway)
+  - name: PyJWT
+    purpose_in_domain: JWT token creation/validation (auth, gateway)
+  - name: agent-orchestrator
+    purpose_in_domain: OrchestratorClient SDK for agent instance management (host)
+  - name: redis.asyncio
+    purpose_in_domain: Token blacklist storage (auth only)
+
+related_dependencies:
+  internal:
+  - component: agentp_shared.db
+    relationship_to_domain: "Provides Base, get_db, AsyncSession. Used by auth+memory only."
+    direction: inbound
+  - component: agentp_shared.models
+    relationship_to_domain: "Defines ORM tables. Only auth+memory import and query them."
+    direction: inbound
+  - component: agentp_shared.config
+    relationship_to_domain: "Provides service URLs (AUTH_URL, HOST_URL, etc.) used by scheduler proxy and gateway."
+    direction: inbound
+  - component: agentp_shared.api_mapping
+    relationship_to_domain: "Provides CreateAgentRequest schema used by host service."
+    direction: inbound
+  - component: agentp_shared.security
+    relationship_to_domain: "Provides create_access_token, decode_token used by auth and gateway."
+    direction: inbound
+  - component: agentp_shared.errors
+    relationship_to_domain: "Provides OHError and error_response used by market, host, scheduler."
+    direction: inbound
+  external:
+  - name: httpx
+    purpose_for_domain: Async HTTP client for request proxying
+  - name: PyJWT
+    purpose_for_domain: JWT encode/decode
+
+open_questions:
+- question: Should the host service's OrchestratorClient be refactored to use platform PostgreSQL (AgentInstance table) instead of its own SQLite?
+  context: "HostService creates a temp directory with instances.db. This data is ephemeral and not shared with other services. The AgentInstance ORM model exists in shared/models.py but is unused."
+  type: decision_blocker
+  affects: [host_hardening]
+- question: Should billing pricing come from the BillingRule table instead of hardcoded _calc_cost()?
+  context: "BillingRule ORM model exists with price_per_input_token and price_per_output_token columns, but billing service ignores it and uses a static formula."
+  type: decision_blocker
+  affects: [billing_hardening]
+- question: Should market data be mutable (admin CRUD) or remain read-only catalog?
+  context: "Market currently has no write endpoints and uses hardcoded seed data. If admin CRUD is needed, a DB table is required."
+  type: decision_blocker
+  affects: [market_hardening]
+- question: Does the scheduler need real task persistence (TaskRecord table)?
+  context: "TaskRecord ORM model exists with scheduling fields (scheduled_at, priority, retry_count). Scheduler currently just proxies and has a trivial _tasks dict stub."
+  type: nice_to_know
+  affects: [scheduler_hardening]
+
+gaps:
+- area: billing DB migration
+  description: "Billing service uses in-memory list[dict] with hardcoded SEED_RECORDS and hardcoded pricing. UsageRecord and BillingRule ORM models exist in shared/models.py but are completely unused by billing service."
+  impact: decision_blocker
+  affects: [billing_hardening]
+- area: market DB migration
+  description: "Market service uses in-memory lists (_templates, _skills, _mcps) populated by _seed(). No DB models exist yet for templates/skills/mcps — they would need to be added to shared/models.py."
+  impact: decision_blocker
+  affects: [market_hardening]
+- area: host DB integration
+  description: "Host service delegates to OrchestratorClient which uses its own SQLite (instances.db in temp dir). The AgentInstance ORM model exists but is not used. Host data is ephemeral and isolated."
+  impact: decision_blocker
+  affects: [host_hardening]
+- area: scheduler task persistence
+  description: "Scheduler has no real task queue — just a proxy + trivial in-memory _tasks dict stub. TaskRecord ORM model exists with full scheduling schema but is unused."
+  impact: nice_to_know
+  affects: [scheduler_hardening]
+- area: billing schemas
+  description: "billing and market have no schemas.py files. Host uses CreateAgentRequest from shared/api_mapping.py. No input validation on billing request params."
+  impact: research_blocker
+  affects: [billing_hardening, market_hardening]
