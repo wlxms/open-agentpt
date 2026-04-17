@@ -18,17 +18,20 @@ scope:
     - "Phase 1: 骨架搭建（6个微服务骨架 + Gateway + shared库）"
     - "Phase 2: 全链路跑通（Gateway → Auth → Scheduler → Host → SDK 实例创建）"
     - "Phase 3: 模块化实现（Auth, Org/Permission, Memory, Market, Billing, Scheduler 逐个完善）"
-    - "Phase 4: 集成测试与 E2E 验证"
+    - "Phase 4: 生产加固（Gateway 限流/熔断/审计, Scheduler Celery任务队列）"
+    - "Phase 5: 集成测试与 E2E 验证"
     - "服务间 HTTP 通信 + JWT 认证"
     - "统一错误码与响应格式（对齐 api-protocol.md）"
     - "TDD: 每个模块先写测试再写实现"
+    - "限流熔断（P6 阶段实现）"
+    - "Celery 异步任务队列（P5 阶段实现）"
+    - "WebSocket 流式通道（P6 阶段实现 stub，post-MVP 完善）"
   out_of_scope:
     - "前端实现（React + Ant Design，后续单独规划）"
-    - "WebSocket 流式通道（预留接口，首期不实现）"
+    - "WebSocket 流式通道完整实现（P6 仅 stub，完整实现 post-MVP）"
     - "gRPC 通道（首期全部用 HTTP）"
     - "Kubernetes 生产部署"
-    - "Celery 异步任务队列（骨架阶段用同步模拟）"
-    - "限流熔断（骨架阶段跳过）"
+    - "配置中心（post-MVP，当前使用 env vars + pydantic-settings）"
 
 acceptance_criteria:
   - criterion: "骨架全链路跑通"
@@ -72,31 +75,44 @@ decisions:
     alternatives: ["uv", "pdm"]
     consequences: ["依赖解析可能比 uv 慢"]
 
+# Test API Key — fixed for all test scenarios and E2E verification
+test_api_key: "sk-3aa4613249a34bc6a54d14f561ca7597"
+
+# Development roadmap reference
+roadmap: docs/plan/roadmap.yaml
+fill_plan: docs/plan/fill_plan.yaml
+
 features:
   - name: "shared 公共库"
     overview: "所有服务共享的 Pydantic 模型、错误码、工具函数、配置基类"
-    status: planned
+    status: completed
   - name: "gateway 网关服务"
     overview: "FastAPI 网关，路由转发、JWT 认证中间件、统一错误处理"
-    status: planned
+    status: in_progress
   - name: "auth 认证服务"
-    overview: "API Key 登录、JWT 签发/刷新/撤销"
-    status: planned
+    overview: "API Key 登录、JWT 签发/刷新/撤销，成员管理，RBAC"
+    status: in_progress
   - name: "host 宿主服务"
     overview: "通过 SDK 的 OrchestratorClient 创建和管理 Agent 实例"
-    status: planned
+    status: in_progress
   - name: "scheduler 中央调度服务"
-    overview: "服务注册发现、任务编排、实例生命周期管理（骨架简化版）"
+    overview: "服务注册发现、任务编排、实例生命周期管理"
     status: planned
   - name: "memory 记忆服务"
-    overview: "路径式资产存储 CRUD"
-    status: planned
+    overview: "路径式资产存储 CRUD，二进制支持，搜索"
+    status: in_progress
   - name: "market 市场服务"
-    overview: "模板、Skill、MCP 浏览"
+    overview: "模板、Skill、MCP 浏览，Agent Config 构建器"
     status: planned
   - name: "billing 计费服务"
-    overview: "Token 消耗统计与费用查询"
-    status: planned
+    overview: "Token 消耗统计、预算管理、CSV 导出、计费规则"
+    status: in_progress
+
+changes:
+  - version: "0.2.0"
+    change: "Add roadmap (P0-P9) and fill plan. Fix test_api_key. Update feature statuses."
+  - version: "0.3.0"
+    change: "Reviewed plan: P5 dep relaxed (P0+P1 only), P7 parallel with P6, config center deferred, WS stub, scope updated, M4 effort reduced."
 
 task_clarifications:
   - question: "开发环境"

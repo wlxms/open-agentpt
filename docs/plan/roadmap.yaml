@@ -1,0 +1,203 @@
+roadmap_id: OHE-roadmap-v2
+version: "1.1.0"
+created_at: "2026-04-18"
+created_by: gem-planner
+status: pending
+
+tldr: |
+  High-level development roadmap for agent-platform (v2, reviewed).
+  10 phases from foundation hardening through E2E acceptance.
+  P1-P4 run in parallel after P0. P5 depends only on P0+P1 (relaxed).
+  P7 runs parallel with P6 (both depend only on P5). P8 depends on P5+P7.
+  WebSocket deferred to post-MVP. Config center deferred. Service registry simplified.
+
+open_questions: []
+
+phases:
+  - id: P0
+    name: "Foundation Hardening"
+    objective: "Complete shared library foundation — new DB models (AgentConfig, Approval, Budget, AuditLog, Template, Skill, McpServer, Category), RBAC primitives with default permissions, test fixtures, Alembic migration, dependency management"
+    key_results:
+      - "All 9 new models added to shared with full unit tests (AgentConfig, AgentConfigVersion, Approval, Budget, AuditLog, Template, Skill, McpServer, Category)"
+      - "Alembic migration 002 generated and applies cleanly (alembic upgrade head + alembic check)"
+      - "Test API key sk-3aa4613249a34bc6a54d14f561ca7597 available as pytest fixture"
+      - "RBAC middleware scaffold (require_role, require_permission) in shared with default permission set defined"
+      - "Default permission set: agents:create/read/destroy/manage, members:manage, billing:manage, configs:manage, approvals:manage, org:manage"
+      - "All new Python dependencies declared in pyproject.toml (celery, python-multipart, pyyaml, httpx-ws)"
+      - "authenticated_client fixture generates JWT directly (no running auth service needed)"
+    modules: ["shared"]
+    dependencies: []
+    estimated_effort: "M"
+    priority: "critical"
+
+  - id: P1
+    name: "Auth & RBAC Completion"
+    objective: "Audit existing auth endpoints, complete to 100% of api-protocol §4.1 + §4.6 — member management CRUD, API key renewal, permission enforcement middleware, roles/permissions endpoints"
+    key_results:
+      - "T1.0: Audit of existing auth endpoints vs §4.1/§4.6 — gap analysis documented"
+      - "POST/DELETE/PUT /org/{id}/members/* endpoints fully implemented with tests"
+      - "POST /org/{id}/api-keys/{key_id}/renew endpoint implemented"
+      - "GET /permissions and GET/PUT /roles/* endpoints implemented"
+      - "RBAC permission middleware rejects unauthorized requests per role"
+      - "All auth endpoints tested with test_api_key fixture; enhanced smoke tests verify new endpoints reachable"
+    modules: ["auth", "shared"]
+    dependencies: ["P0"]
+    estimated_effort: "M"
+    priority: "high"
+
+  - id: P2
+    name: "Market Service Full Implementation"
+    objective: "Replace in-memory stubs with PostgreSQL persistence, implement Agent Config builder (api-protocol §4.3 — 11 endpoints)"
+    key_results:
+      - "Market data models (AgentConfig, template publish/version) persisted to PostgreSQL"
+      - "All 11 builder endpoints (§4.3.2) implemented: CRUD, publish, duplicate, versions, preview, validate, import, export"
+      - "Marketplace browse endpoints (§4.4) return real data from DB"
+      - "Config validation logic (model params, MCP transport, permission modes)"
+      - "Full test coverage for builder + marketplace; smoke + production gates pass"
+      - "YAML import uses yaml.safe_load() exclusively (security); sensitive fields masked on export"
+      - "Enhanced smoke tests verify new endpoints reachable"
+    modules: ["market", "shared"]    dependencies: ["P0"]
+    estimated_effort: "L"
+    priority: "high"
+
+  - id: P3
+    name: "Billing Service Completion"
+    objective: "Complete billing to cover api-protocol §4.5 — budget management, CSV export, billing rules API, multi-level org aggregation"
+    key_results:
+      - "GET/PUT /billing/budget endpoints implemented with Budget model"
+      - "GET /billing/export returns CSV file download with proper headers"
+      - "GET/POST/PUT /billing/rules endpoints for billing rule CRUD"
+      - "Multi-level org aggregation: summary rolls up from child orgs"
+      - "GET /billing/summary returns all fields: total_tokens, total_cost, budget, budget_remaining, by_instance[], by_model[], daily_trend[]"
+      - "Full test coverage; smoke + production gates pass"
+      - "Enhanced smoke tests verify new endpoints reachable"
+    modules: ["billing", "shared"]
+    dependencies: ["P0"]
+    estimated_effort: "M"
+    priority: "high"
+
+  - id: P4
+    name: "Memory Service Enhancement"
+    objective: "Extend memory service beyond basic path CRUD — binary file support, search, tree browse, large file support"
+    key_results:
+      - "Binary file upload/download (multipart/form-data, file stream responses)"
+      - "GET /memory/search with keyword matching and pagination"
+      - "GET /memory/assets returns tree structure (recursive directory listing)"
+      - "Large file support: content stored in filesystem, metadata in PostgreSQL"
+      - "Full test coverage with binary fixtures; smoke + production gates pass"
+    modules: ["memory", "shared"]
+    dependencies: ["P0"]
+    estimated_effort: "S"
+    priority: "medium"
+    note: "T4.1, T4.2, T4.3 are independent (all depend only on P0) — can be parallelized"
+
+  - id: P5
+    name: "Scheduler Business Orchestration"
+    objective: "Transform scheduler from HTTP proxy into business orchestration hub — simplified health checks, approval workflow, instance lifecycle management, Celery task queue"
+    key_results:
+      - "Health check endpoint aggregation (simplified: periodic /health calls, status tracking in Redis — NOT a full service registry)"
+      - "Approval workflow engine (Approval model + CRUD + approve/reject endpoints from §4.7)"
+      - "Instance lifecycle management: idle detection, quota check before create, status aggregation"
+      - "Celery integration: async tasks for instance creation, idle reclamation, daily report"
+      - "scripts/dev_start.ps1 updated to start celery worker and celery beat"
+      - "Config center DEFERRED to post-MVP — use env vars + pydantic-settings (already in use per require.md §9.5)"
+      - "Full test coverage; enhanced smoke tests verify new endpoints"
+    modules: ["scheduler", "shared"]
+    dependencies: ["P0", "P1"]
+    estimated_effort: "L"
+    priority: "high"
+    note: "Removed dependency on P2, P3, P4 — scheduler core doesn't need market/billing/memory. Only needs RBAC from P1 for approval workflow."
+
+  - id: P6
+    name: "Gateway Production Hardening"
+    objective: "Add production-ready features to gateway — rate limiting, CORS, audit logging, WebSocket streaming, load balancing"
+    key_results:
+      - "Redis-based rate limiting (global, org-level, user-level, endpoint-level)"
+      - "CORS middleware with configurable origins"
+      - "Audit log middleware: log every request to database (timestamp, IP, API key, path, status, latency)"
+      - "WebSocket streaming DEFERRED to post-MVP — stub endpoint returns 501 Not Implemented"
+      - "Circuit breaker for downstream service failures"
+      - "Full test coverage; smoke + production gates pass"
+    modules: ["gateway", "shared"]
+    dependencies: ["P5"]
+    estimated_effort: "L"
+    priority: "high"
+
+  - id: P7
+    name: "Host Service Advanced Operations"
+    objective: "Implement all remaining Host endpoints from api-protocol §4.2 — restart/batch, command, skills, MCP, config, monitor, memory sync"
+    key_results:
+      - "POST /agents/{id}/restart and POST /agents/batch-restart, batch-destroy implemented"
+      - "POST /agents/{id}/command, /skills, /mcp, PUT /agents/{id}/config implemented"
+      - "GET /agents/{id}/monitor returns CPU/memory/token stats"
+      - "Memory sync endpoints: tree, upload, download per instance"
+      - "Enhanced smoke tests verify new endpoints reachable"
+      - "Full test coverage; smoke + production gates pass"
+    modules: ["host", "shared"]
+    dependencies: ["P5"]
+    estimated_effort: "L"
+    priority: "medium"
+    note: "Removed dependency on P6 — host advanced ops (restart, command, skills, MCP, config) don't need gateway rate limiting or circuit breaker."
+
+  - id: P8
+    name: "Event Bus Integration"
+    objective: "Activate EventBus across all services — publish/subscribe events for agent lifecycle, usage, approvals, billing alerts"
+    key_results:
+      - "Each service initializes EventBus in its lifespan handler (via app.state, NOT module singleton — avoid test conflicts)"
+      - "Host publishes agent.created/destroyed/status_changed events"
+      - "Billing publishes agent.usage and billing.alert events"
+      - "Scheduler subscribes to events and triggers workflows"
+      - "Auth publishes permission.changed events"
+      - "Integration tests verify event flow across services via Redis Streams"
+    modules: ["shared", "gateway", "auth", "host", "scheduler", "billing", "market", "memory"]
+    dependencies: ["P5", "P7"]
+    estimated_effort: "M"
+    priority: "medium"
+    note: "Removed dependency on P6 — EventBus activation only needs scheduler (P5) and host (P7). Gateway audit events can be added later."
+
+  - id: P9
+    name: "Integration & E2E Acceptance"
+    objective: "Full cross-service E2E testing, performance benchmarks, and production readiness validation"
+    key_results:
+      - "E2E test suite covering full Agent lifecycle: login → create instance → interact → destroy → verify billing"
+      - "E2E test for approval workflow: request → approve → instance created"
+      - "E2E test for market → builder flow: browse template → customize config → publish → create instance from config"
+      - "Performance benchmarks: API latency p95 < 200ms for CRUD, p95 < 2s for instance creation"
+      - "All existing tests still pass (no regressions)"
+      - "Production deployment script runs successfully on clean environment"
+    modules: ["all"]
+    dependencies: ["P8"]
+    estimated_effort: "L"
+    priority: "high"
+
+review_metadata:
+  reviewed_at: "2026-04-18"
+  reviewed_by: gem-critic
+  verdict: needs_changes
+  changes_applied:
+    - "P0: Added AuditLog, Template, Skill, McpServer, Category models; added dependency management task; fixed authenticated_client to generate JWT directly; added default permission set"
+    - "P1: Added T1.0 audit task; enhanced smoke test requirements"
+    - "P2: Added YAML safe_load requirement; sensitive field masking on export"
+    - "P3: Expanded T3.4 to cover all summary response fields"
+    - "P4: Changed effort to S (MemoryAsset already has needed columns); tasks made parallelizable"
+    - "P5: Deferred config center; simplified service registry; moved Celery to first task; relaxed dependencies (P0+P1 only); added dev_start.ps1 update"
+    - "P6: Deferred WebSocket to post-MVP; removed WebSocket from key_results"
+    - "P7: Removed P6 dependency (parallel with P6); removed process pool from scope; changed effort to L"
+    - "P8: Removed P6 dependency; EventBus via app.state not module singleton"
+
+milestones:
+  - name: "Foundation Complete"
+    phase: P0
+    description: "Shared library hardened, new models migrated, test infrastructure ready"
+  - name: "Core Services Complete"
+    phase: P3
+    description: "Auth, Market, Billing fully implemented — platform handles users, configs, and billing"
+  - name: "Orchestration Ready"
+    phase: P5
+    description: "Scheduler has real business logic, approval workflow, Celery tasks operational"
+  - name: "Production Ready"
+    phase: P8
+    description: "Gateway hardened, all events flowing, Host fully functional"
+  - name: "Ship It"
+    phase: P9
+    description: "E2E validated, performance benchmarks met, ready for frontend integration"

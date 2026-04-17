@@ -1,0 +1,2249 @@
+plan_id: OHE-fill-plan-v2
+version: "1.1.0"
+created_at: "2026-04-18"
+created_by: gem-planner
+status: pending
+research_confidence: high
+
+# Test API Key for all test scenarios
+test_api_key: "sk-3aa4613249a34bc6a54d14f561ca7597"
+
+tldr: |
+  Detailed module-by-module fill plan for agent-platform phases P0-P3.
+  P0-P3 are fully specified with TDD steps (test → implement → verify → smoke → production).
+  P4-P7 are outlined at module level with task descriptions.
+  P8-P9 are integration phases.
+  Total: 4 detailed phases, 6 outlined phases, 30+ tasks.
+
+open_questions: []
+
+pre_mortem:
+  overall_risk_level: medium
+  critical_failure_modes:
+    - scenario: "Alembic migration conflicts with existing data in dev databases"
+      likelihood: medium
+      impact: medium
+      mitigation: "Migration uses nullable columns + defaults; run alembic check after upgrade; include downgrade path"
+    - scenario: "AgentConfig model complexity (11 nested JSON fields) causes validation issues"
+      likelihood: medium
+      impact: high
+      mitigation: "Use Pydantic nested models for validation; write comprehensive schema tests before model"
+    - scenario: "Celery + asyncpg event loop conflict in scheduler tasks"
+      likelihood: high
+      impact: medium
+      mitigation: "Use NullPool in task DB connections; create fresh engine per task execution (from debugging notes)"
+    - scenario: "Test API key fixture conflicts with real API key auth"
+      likelihood: low
+      impact: medium
+      mitigation: "Use dedicated test database + seed data; fixture sets key in test isolation"
+  assumptions:
+    - "PostgreSQL and Redis containers (agentp-pg, agentp-redis) are running via Podman"
+    - "Python 3.11+ venv is activated at .venv"
+    - "Existing models (Organization, User, ApiKey, AgentInstance, UsageRecord, MemoryAsset, BillingRule, TaskRecord) are NOT recreated"
+    - "SDK noop driver is used for all Host tests (real Podman driver is future work)"
+    - "pytest-asyncio with asyncio_mode=auto is configured; session-scoped async fixtures avoided (from debugging notes)"
+
+review:
+  reviewed_at: "2026-04-18"
+  reviewed_by: gem-critic
+  verdict: needs_changes
+  blocking_issues_found: 4
+  high_issues_found: 8
+  changes_applied:
+    - "Added T0.0: dependency management task"
+    - "T0.1: Added AuditLog, Template, Skill, McpServer, Category models (9 total new models)"
+    - "T0.3: Changed authenticated_client to generate JWT directly (no running auth service); specified function-scoped fixtures"
+    - "T0.4: Added default permission set definition"
+    - "M1: Added T1.0 audit task; enhanced smoke tests"
+    - "M2 T2.3: Added yaml.safe_load requirement and sensitive field masking"
+    - "M3 T3.4: Expanded test to cover by_instance, by_model, daily_trend"
+    - "M4: All tasks made parallelizable (depend only on T0.2, not each other); changed effort to S"
+    - "M5: Removed T5.5 (config center deferred); simplified T5.1 (health checks not full registry); moved Celery setup earlier; relaxed T5.2 dependencies; added dev_start.ps1 update to T5.4"
+    - "M6: Deferred T6.5 (WebSocket) — stub returns 501"
+    - "M7: Removed P6 dependency; tasks depend only on P5"
+    - "M8: T8.1 specifies EventBus via app.state, not module singleton"
+    - "All modules: Enhanced smoke_test steps to verify new endpoints are reachable"
+
+implementation_specification:
+  code_structure: |
+    Each service follows the existing pattern:
+    services/{name}/src/agentp_{name}/
+      ├── __init__.py
+      ├── __main__.py
+      ├── main.py        # FastAPI app + lifespan
+      ├── config.py      # Service-specific settings
+      ├── service.py     # Business logic
+      ├── schemas.py     # Pydantic request/response models
+      └── api/           # Route handlers
+          ├── __init__.py
+          └── routes.py
+    Tests go in agent-platform/tests/test_{name}.py
+    Shared utilities in services/shared/src/agentp_shared/
+  affected_areas:
+    - "services/shared/src/agentp_shared/models.py — new models"
+    - "services/shared/src/agentp_shared/schemas.py — new Pydantic schemas"
+    - "services/shared/src/agentp_shared/security.py — RBAC primitives"
+    - "alembic/versions/ — new migration file"
+    - "tests/conftest.py — shared fixtures"
+    - "services/auth/src/agentp_auth/ — member management, key renewal, roles"
+    - "services/market/src/agentp_market/ — persistence, builder endpoints"
+    - "services/billing/src/agentp_billing/ — budget, CSV, rules, aggregation"
+  component_details:
+    - component: "AgentConfig model"
+      responsibility: "Store Agent configuration with 11 configurable dimensions per api-protocol §4.3.1"
+      interfaces:
+        - "AgentConfig SQLAlchemy model with JSONB columns for personality, model, tools, skills, mcp_servers, workspace, permissions, appearance"
+        - "AgentConfigVersion model for version history"
+    - component: "Approval model"
+      responsibility: "Track approval workflow requests"
+      interfaces:
+        - "Approval SQLAlchemy model with status enum (pending/approved/rejected)"
+        - "CRUD operations via approval service"
+    - component: "Budget model"
+      responsibility: "Organization billing budget with alert rules"
+      interfaces:
+        - "Budget SQLAlchemy model with JSONB alert_rules"
+        - "Threshold check function"
+    - component: "RBAC middleware"
+      responsibility: "Enforce role-based access on API endpoints"
+      interfaces:
+        - "require_role(role) decorator for FastAPI routes"
+        - "require_permission(permission) decorator"
+        - "Permission check against user's permissions list"
+  dependencies:
+    - component: "shared.models"
+      relationship: "All services import models from agentp_shared.models"
+    - component: "alembic"
+      relationship: "Migration must be generated after model changes and applied before service tests"
+  integration_points:
+    - "tests/conftest.py — shared fixtures available to all test files"
+    - "alembic/env.py — migration environment reads from shared models"
+    - "services/shared/src/agentp_shared/__init__.py — public API exports"
+
+contracts: []
+
+modules:
+  # ============================================================================
+  # P0: FOUNDATION HARDENING (detailed)
+  # ============================================================================
+  - id: M0-shared-hardening
+    phase: P0
+    name: "Shared Library Hardening"
+    description: "Complete shared library foundation — new DB models, RBAC primitives, test fixtures, Alembic migration"
+    agent: gem-implementer
+    tasks:
+      - id: T0.0
+        name: "Dependency management — update pyproject.toml"
+        tdd:
+          test: |
+            Write tests in tests/test_dependencies.py:
+            - import celery succeeds
+            - import multipart succeeds
+            - import yaml succeeds
+            - import httpx succeeds
+            - All existing imports still work (no version conflicts)
+          implement: |
+            Update agent-platform/pyproject.toml:
+            - Add celery[redis] (for P5)
+            - Add python-multipart (for P4 binary uploads)
+            - Add pyyaml (for P2 import/export)
+            - Add httpx-ws (for P6 WebSocket, optional)
+            Pin compatible versions. Run pip install -e . to verify.
+          verify: "pytest tests/test_dependencies.py -v"
+          smoke_test: "python -c 'import celery; import multipart; import yaml; print(ok)'"
+          production_test: "pip install -e . — all dependencies install without conflicts"
+        estimated_files: 1
+        estimated_lines: 30
+        priority: "critical"
+        status: "pending"
+        dependencies: []
+        context_files:
+          - path: "agent-platform/pyproject.toml"
+            description: "Root project config — add new dependencies"
+        verification:
+          - "All new packages importable"
+          - "No version conflicts with existing packages"
+        acceptance_criteria:
+          - "celery, python-multipart, pyyaml added to pyproject.toml"
+          - "pip install -e . succeeds"
+        failure_modes:
+          - scenario: "Version conflict between new and existing packages"
+            likelihood: low
+            impact: medium
+            mitigation: "Pin specific compatible versions; use pip's resolution output to identify conflicts"
+        tech_stack:
+          - "pip"
+          - "pytest"
+        test_coverage: "dependencies"
+
+      - id: T0.1
+        name: "Add missing DB models (AgentConfig, Approval, Budget)"
+        tdd:
+          test: |
+            Write tests in tests/test_models.py:
+            - AgentConfig: create with all 11 JSONB fields (personality, model, tools, skills, mcp_servers, workspace, permissions, appearance)
+            - AgentConfig: defaults for visibility='private', version='1.0.0'
+            - AgentConfigVersion: FK to agent_config, fields version/changelog/created_at
+            - Approval: FK to user + org, status enum (pending/approved/rejected), template_name, config_summary, reason, reviewed_by, reviewed_at
+            - Budget: FK to org, threshold (Numeric), alert_rules (JSONB), timestamps
+            - AuditLog: timestamp, source_ip, api_key_id, user_id, org_id, method, path, query_params (JSONB), status_code, latency_ms, request_id
+            - Template: FK to org + author, name, description, category, scenario, skills (JSONB), mcp (JSONB), resource_spec (JSONB), usage_count, visibility, published_at
+            - Skill: name, description, author, version, package_url, category
+            - McpServer: name, transport (enum: stdio|http|ws), description, config_template (JSONB), category
+            - Category: name, icon (nullable), display_order
+          implement: |
+            Add AgentConfig, AgentConfigVersion, Approval, Budget, AuditLog, Template, Skill, McpServer, Category classes to
+            services/shared/src/agentp_shared/models.py following existing model patterns
+            (UUID primary keys, _utcnow defaults, proper indexes, JSONB columns).
+            Do NOT modify existing models.
+          verify: "pytest tests/test_models.py -v — all new model tests pass"
+          smoke_test: "pytest tests/test_smoke_infrastructure.py — existing smoke tests still pass"
+          production_test: |
+            Verify against real PostgreSQL (Podman):
+            1. alembic upgrade head (new migration applies)
+            2. alembic check (no drift)
+            3. Manual: insert + select + delete for each new model via psql
+        estimated_files: 3
+        estimated_lines: 250
+        priority: "high"
+        status: "pending"
+        dependencies: []
+        context_files:
+          - path: "agent-platform/services/shared/src/agentp_shared/models.py"
+            description: "Existing models — follow same patterns for new models"
+          - path: "agent-platform/tests/test_models.py"
+            description: "Existing model tests — extend with new model tests"
+        verification:
+          - "All 3 new models create/read/delete successfully"
+          - "JSONB fields store and retrieve nested dicts correctly"
+          - "Foreign keys reference correct parent tables"
+        acceptance_criteria:
+          - "AgentConfig model has all fields from api-protocol §4.3.1"
+          - "Approval model has status enum and audit trail fields"
+          - "Budget model has threshold and alert_rules JSONB"
+          - "All models have proper indexes"
+        failure_modes:
+          - scenario: "JSONB column serialization issues with nested dicts"
+            likelihood: medium
+            impact: low
+            mitigation: "Test with deeply nested structures; use sa.JSON directly"
+        tech_stack:
+          - "SQLAlchemy 2.0"
+          - "pytest"
+        test_coverage: "models"
+
+      - id: T0.2
+        name: "Generate Alembic migration for new models"
+        tdd:
+          test: |
+            Write tests in tests/test_migration.py:
+            - Migration file exists at alembic/versions/002_add_new_models.py
+            - Migration creates agent_configs, agent_config_versions, approvals, budgets tables
+            - Migration adds new indexes and constraints
+            - Downgrade drops new tables cleanly
+          implement: |
+            Run alembic revision --autogenerate -m "add agent_config approval budget models"
+            Review generated migration for correctness.
+            Verify upgrade and downgrade paths.
+          verify: "pytest tests/test_migration.py -v"
+          smoke_test: "alembic upgrade head && alembic downgrade base && alembic upgrade head — roundtrip succeeds"
+          production_test: "alembic check on production schema — no drift"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.1"]
+        context_files:
+          - path: "agent-platform/alembic/versions/"
+            description: "Existing migrations — follow naming convention"
+          - path: "agent-platform/alembic/env.py"
+            description: "Migration environment config"
+        verification:
+          - "Migration upgrades cleanly"
+          - "Migration downgrades cleanly"
+          - "No schema drift after upgrade"
+        acceptance_criteria:
+          - "Migration file follows naming convention 002_*.py"
+          - "All 4 new tables created with correct columns"
+          - "Downgrade path removes all new tables"
+        failure_modes:
+          - scenario: "Autogenerate misses indexes or constraints"
+            likelihood: low
+            impact: low
+            mitigation: "Manually review migration file; compare against model definitions"
+        tech_stack:
+          - "Alembic"
+          - "SQLAlchemy"
+        test_coverage: "migration"
+
+      - id: T0.3
+        name: "Add test API key fixture and shared Pydantic schemas"
+        tdd:
+          test: |
+            Write tests in tests/test_fixtures.py:
+            - test_api_key fixture returns "sk-3aa4613249a34bc6a54d14f561ca7597"
+            - authenticated_client fixture creates httpx.AsyncClient with valid JWT
+            - db_session fixture provides clean async session per test (row-level cleanup, NOT drop_all)
+          implement: |
+            1. Add test_api_key fixture to tests/conftest.py (session-scoped, returns string constant)
+            2. Add test_admin_api_key fixture (session-scoped)
+            3. Add authenticated_client fixture (FUNCTION-scoped) that:
+               - Generates JWT directly using shared.security.create_access_token()
+               - Does NOT call auth service HTTP endpoint (avoids chicken-and-egg)
+               - Returns httpx.AsyncClient with Authorization header
+            4. Add db_session fixture (FUNCTION-scoped, row-level cleanup via DELETE)
+            5. Add Pydantic schemas for new models to shared/schemas.py:
+               - AgentConfigCreate, AgentConfigUpdate, AgentConfigResponse
+               - ApprovalCreate, ApprovalResponse
+               - BudgetCreate, BudgetUpdate, BudgetResponse
+          verify: "pytest tests/test_fixtures.py -v"
+          smoke_test: "Existing tests that use conftest fixtures still pass"
+          production_test: "N/A (test-only change)"
+        estimated_files: 2
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.1"]
+        context_files:
+          - path: "agent-platform/tests/conftest.py"
+            description: "Existing test fixtures — extend with new ones"
+          - path: "agent-platform/services/shared/src/agentp_shared/schemas.py"
+            description: "Existing Pydantic schemas — extend"
+        verification:
+          - "test_api_key fixture returns correct value"
+          - "authenticated_client can make authenticated API calls"
+          - "No test isolation issues (row cleanup works)"
+        acceptance_criteria:
+          - "test_api_key returns 'sk-3aa4613249a34bc6a54d14f561ca7597'"
+          - "authenticated_client fixture available to all tests"
+          - "Pydantic schemas validate all fields from api-protocol §4.3.1"
+        failure_modes:
+          - scenario: "Session-scoped event loop conflicts with function-scoped fixtures"
+            likelihood: medium
+            impact: high
+            mitigation: "conftest.py uses loop_scope='session' (all tests share one loop). Function-scoped fixtures MUST NOT create new event loops — use the existing loop's run_until_complete or async with. DB sessions use NullPool per debugging notes."
+        tech_stack:
+          - "pytest"
+          - "Pydantic v2"
+          - "httpx"
+        test_coverage: "fixtures, schemas"
+
+      - id: T0.4
+        name: "Add RBAC middleware primitives to shared"
+        tdd:
+          test: |
+            Write tests in tests/test_rbac.py:
+            - require_role('admin') allows admin users, rejects non-admin
+            - require_permission('agents:create') allows users with permission, rejects without
+            - Permission check works with flat permission list from ApiKey.permissions JSONB
+            - Default permissions defined: agents:create, agents:read, agents:destroy, agents:manage, members:manage, billing:manage, configs:manage, approvals:manage, org:manage
+            - Default roles defined: admin (all permissions), manager (agents:*, members:read, billing:read), member (agents:create, agents:read, configs:manage)
+          implement: |
+            Add to services/shared/src/agentp_shared/security.py:
+            - require_role(role: str) FastAPI dependency
+            - require_permission(permission: str) FastAPI dependency
+            - has_permission(user_permissions: list[str], required: str) -> bool
+            - Permission hierarchy: admin > manager > member (admin inherits all)
+          verify: "pytest tests/test_rbac.py -v"
+          smoke_test: "Existing auth tests still pass (no regressions)"
+          production_test: "N/A (shared library change, tested via service integration)"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T0.3"]
+        context_files:
+          - path: "agent-platform/services/shared/src/agentp_shared/security.py"
+            description: "Existing security utils — extend with RBAC"
+        verification:
+          - "Role check correctly allows/rejects based on user.role"
+          - "Permission check works with nested permission strings"
+          - "Admin role bypasses all permission checks"
+        acceptance_criteria:
+          - "require_role and require_permission are importable from agentp_shared.security"
+          - "Admin inherits all permissions"
+          - "Unit tests cover role hierarchy and permission matching"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "rbac"
+    acceptance_criteria:
+      - "All 9 new models (AgentConfig, AgentConfigVersion, Approval, Budget, AuditLog, Template, Skill, McpServer, Category) have unit tests"
+      - "Alembic migration 002 generated and applies/downgrades cleanly"
+      - "Test API key fixture available in conftest.py"
+      - "RBAC middleware primitives implemented with tests"
+      - "Default permission set and roles defined"
+    estimated_effort: "M"
+
+  # ============================================================================
+  # P1: AUTH & RBAC COMPLETION (detailed)
+  # ============================================================================
+  - id: M1-auth-completion
+    phase: P1
+    name: "Auth & RBAC Completion"
+    description: "Complete auth service to 100% of api-protocol §4.6 — member CRUD, API key renewal, roles/permissions endpoints"
+    agent: gem-implementer
+    tasks:
+      - id: T1.0
+        name: "Audit existing auth endpoints vs api-protocol §4.1 + §4.6"
+        tdd:
+          test: |
+            Write tests in tests/test_auth_audit.py:
+            - List all implemented auth endpoints (from route registration)
+            - Compare against api-protocol §4.1 (4 endpoints) and §4.6 (14 endpoints)
+            - Document which endpoints exist, which are stubs, which are missing
+            - Verify existing endpoints return correct response format
+          implement: |
+            Read auth service route definitions. Cross-reference with api-protocol §4.1 + §4.6.
+            Create a gap analysis document (can be a test assertion that fails with clear message listing gaps).
+            This task does NOT implement missing endpoints — it only identifies them.
+          verify: "pytest tests/test_auth_audit.py -v"
+          smoke_test: "pytest tests/test_health_auth.py — auth health check passes"
+          production_test: "curl auth endpoints → verify response format matches api-protocol"
+        estimated_files: 1
+        estimated_lines: 80
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.4"]
+        context_files:
+          - path: "agent-platform/services/auth/src/agentp_auth/"
+            description: "Auth service routes — audit against api-protocol"
+          - path: "agent-platform/docs/api-protocol.md"
+            description: "§4.1 + §4.6 endpoint definitions"
+        verification:
+          - "Gap analysis covers all §4.1 and §4.6 endpoints"
+          - "Existing endpoints verified for correct response format"
+        acceptance_criteria:
+          - "Complete list of implemented vs missing auth endpoints"
+          - "Response format verified for existing endpoints"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "auth_audit"
+
+      - id: T1.1
+        name: "Member management CRUD (§4.6 org members endpoints)"
+        tdd:
+          test: |
+            Write tests in tests/test_auth_members.py:
+            - GET /api/v1/org/{id}/members — list with pagination, role filter
+            - POST /api/v1/org/{id}/members — add member with role, duplicate check
+            - DELETE /api/v1/org/{id}/members/{user_id} — remove member
+            - PUT /api/v1/org/{id}/members/{user_id} — change role
+            - Cannot remove last admin from org
+            - Non-admin cannot add/remove members
+          implement: |
+            Add member management functions to auth service.py:
+            - list_org_members(org_id, page, page_size, role)
+            - add_org_member(org_id, user_id, role)
+            - remove_org_member(org_id, user_id)
+            - update_member_role(org_id, user_id, role)
+            Add routes to auth/api/.
+          verify: "pytest tests/test_auth_members.py -v"
+          smoke_test: "pytest tests/test_health_auth.py — auth health check passes; curl http://localhost:8001/api/v1/org/org-root/members → expect 200"
+          production_test: "curl chain: create org → add member → list members → change role → remove member"
+        estimated_files: 2
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T1.0"]
+        context_files:
+          - path: "agent-platform/services/auth/src/agentp_auth/service.py"
+            description: "Existing auth service — add member management functions"
+          - path: "agent-platform/services/auth/src/agentp_auth/api/"
+            description: "Existing auth routes — add member endpoints"
+        verification:
+          - "All 4 member endpoints return correct response format"
+          - "Role validation prevents invalid roles"
+          - "Cannot remove last admin"
+        acceptance_criteria:
+          - "GET/POST/DELETE/PUT /org/{id}/members/* match api-protocol §4.6"
+          - "Permission checks enforced via RBAC middleware"
+          - "Pagination works correctly"
+        failure_modes:
+          - scenario: "Member added to non-existent org"
+            likelihood: low
+            impact: low
+            mitigation: "FK constraint + 404 check in service layer"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "auth_members"
+
+      - id: T1.2
+        name: "API key renewal (§4.6 POST /org/{id}/api-keys/{key_id}/renew)"
+        tdd:
+          test: |
+            Write tests in tests/test_auth_apikey.py:
+            - POST /api/v1/org/{id}/api-keys/{key_id}/renew with expires_in_days
+            - Returns new expires_at
+            - Cannot renew revoked key (403)
+            - Cannot renew key from different org (403)
+            - Renewal updates last_used_at to null
+          implement: |
+            Add renew_api_key function to auth service.py.
+            Add POST route for /org/{id}/api-keys/{key_id}/renew.
+          verify: "pytest tests/test_auth_apikey.py -v"
+          smoke_test: "Existing API key tests still pass; curl http://localhost:8001/api/v1/org/org-root/members → expect 200"
+          production_test: "curl: create key → renew → verify new expiry"
+        estimated_files: 2
+        estimated_lines: 100
+        priority: "high"
+        status: "pending"
+        dependencies: ["T1.1"]
+        context_files:
+          - path: "agent-platform/services/auth/src/agentp_auth/service.py"
+            description: "Existing API key functions — add renew"
+        verification:
+          - "Renewal extends expires_at by specified days"
+          - "Revoked keys cannot be renewed"
+          - "Cross-org renewal rejected"
+        acceptance_criteria:
+          - "POST /org/{id}/api-keys/{key_id}/renew implemented per §4.6"
+          - "Returns { expires_at: ISO8601 }"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "auth_apikey"
+
+      - id: T1.3
+        name: "Roles and permissions management (§4.6 GET /permissions, GET/PUT /roles)"
+        tdd:
+          test: |
+            Write tests in tests/test_auth_roles.py:
+            - GET /api/v1/permissions — lists all defined permissions (admin only)
+            - GET /api/v1/roles — lists all roles with their permissions (admin only)
+            - PUT /api/v1/roles/{id} — update role permissions (admin only)
+            - Non-admin gets 403
+            - Invalid role ID returns 404
+          implement: |
+            Add role/permission management to auth service.py.
+            Define default permission set and role-permission mapping.
+            Store role definitions in database or config.
+            Add routes for GET /permissions, GET /roles, PUT /roles/{id}.
+          verify: "pytest tests/test_auth_roles.py -v"
+          smoke_test: "pytest tests/test_auth.py — existing auth tests pass; curl http://localhost:8001/api/v1/org/org-root/members → expect 200"
+          production_test: "curl: login as admin → list permissions → list roles → update role"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T1.1"]
+        context_files:
+          - path: "agent-platform/services/auth/src/agentp_auth/service.py"
+            description: "Existing auth service — add role management"
+        verification:
+          - "Permission list returned matches all defined permissions"
+          - "Role update persists correctly"
+          - "Non-admin access rejected"
+        acceptance_criteria:
+          - "GET /permissions, GET /roles, PUT /roles/{id} match §4.6"
+          - "Admin-only access enforced"
+          - "Default roles: admin, manager, member with appropriate permissions"
+        failure_modes:
+          - scenario: "Role update breaks existing permission checks"
+            likelihood: low
+            impact: high
+            mitigation: "Permission system uses string matching, not hardcoded roles"
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "auth_roles"
+    acceptance_criteria:
+      - "All §4.6 auth endpoints implemented and tested"
+      - "RBAC middleware enforced on all new endpoints"
+      - "Member management, API key renewal, roles/permissions all functional"
+      - "Enhanced smoke tests verify new endpoints reachable"
+    estimated_effort: "M"
+
+  # ============================================================================
+  # P2: MARKET SERVICE FULL IMPLEMENTATION (detailed)
+  # ============================================================================
+  - id: M2-market-implementation
+    phase: P2
+    name: "Market Service Full Implementation"
+    description: "Replace in-memory stubs with PostgreSQL persistence, implement Agent Config builder (api-protocol §4.3 — 11 endpoints) and marketplace browse (§4.4)"
+    agent: gem-implementer
+    tasks:
+      - id: T2.1
+        name: "Marketplace persistence — migrate from in-memory to PostgreSQL"
+        tdd:
+          test: |
+            Write tests in tests/test_market.py:
+            - Templates stored in PostgreSQL (use existing AgentConfig model or new Template model)
+            - CRUD operations persist across service restarts
+            - Pagination, keyword search, category filter work on DB data
+            - Skills and MCPs stored in DB with proper relationships
+            - Categories endpoint returns real data
+          implement: |
+            1. Use Template, Skill, McpServer, Category models from T0.1 (already in shared)
+            2. Rewrite market service.py to use async SQLAlchemy instead of in-memory lists
+            3. Keep backward compatibility with existing route structure
+            4. Add seed data migration for default categories and sample entries
+          verify: "pytest tests/test_market.py -v"
+          smoke_test: "pytest tests/test_health_market.py — market health check passes; curl http://localhost:8005/api/v1/market/templates → expect 200"
+          production_test: "curl: start service → list templates → create template → stop → restart → list (data persists)"
+        estimated_files: 3
+        estimated_lines: 300
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.2"]
+        context_files:
+          - path: "agent-platform/services/market/src/agentp_market/service.py"
+            description: "Current in-memory implementation — replace with PostgreSQL"
+          - path: "agent-platform/services/market/src/agentp_market/schemas.py"
+            description: "Existing schemas — extend for persistence"
+        verification:
+          - "Data persists across service restarts"
+          - "All §4.4 marketplace endpoints return DB-backed data"
+          - "Pagination works correctly with DB queries"
+        acceptance_criteria:
+          - "No in-memory state — all data in PostgreSQL"
+          - "GET /market/templates, /skills, /mcps, /categories from §4.4 implemented"
+          - "Keyword search and category filter work"
+        failure_modes:
+          - scenario: "Seed data conflicts with existing DB state"
+            likelihood: low
+            impact: low
+            mitigation: "Use INSERT ... ON CONFLICT DO NOTHING for seed data"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "market"
+
+      - id: T2.2
+        name: "Agent Config builder — CRUD endpoints (§4.3.2 configs CRUD)"
+        tdd:
+          test: |
+            Write tests in tests/test_builder_crud.py:
+            - POST /api/v1/builder/configs — create config with all 11 dimensions
+            - GET /api/v1/builder/configs — list with visibility/keyword filter
+            - GET /api/v1/builder/configs/{id} — full config response
+            - PUT /api/v1/builder/configs/{id} — partial update (PATCH semantics)
+            - DELETE /api/v1/builder/configs/{id} — soft delete or hard delete
+            - Config version auto-incremented on update
+          implement: |
+            Add builder routes to market service (or separate builder module):
+            - Use AgentConfig model from T0.1
+            - Validate config against AgentConfigSchema (all fields from §4.3.1)
+            - Store personality, model, tools, skills, mcp_servers, workspace, permissions, appearance as JSONB
+            - Auto-increment version on update, create AgentConfigVersion record
+          verify: "pytest tests/test_builder_crud.py -v"
+          smoke_test: "All existing market tests still pass"
+          production_test: "curl chain: create config → get → update → get (version bumped) → delete"
+        estimated_files: 3
+        estimated_lines: 250
+        priority: "high"
+        status: "pending"
+        dependencies: ["T2.1"]
+        context_files:
+          - path: "agent-platform/services/shared/src/agentp_shared/models.py"
+            description: "AgentConfig model from T0.1"
+          - path: "agent-platform/agent-platform/docs/api-protocol.md"
+            description: "§4.3.1 AgentConfig data model specification"
+        verification:
+          - "All 11 config dimensions stored and retrieved correctly"
+          - "Version auto-incremented on update"
+          - "Visibility filter works (private/org/public)"
+          - "Partial update (PATCH semantics) works"
+        acceptance_criteria:
+          - "GET/POST/PUT/DELETE /builder/configs/* match §4.3.2"
+          - "Config validation rejects invalid model params, MCP transport, permission modes"
+          - "Version history created on each update"
+        failure_modes:
+          - scenario: "Complex nested JSONB validation edge cases"
+            likelihood: medium
+            impact: medium
+            mitigation: "Use nested Pydantic models for each dimension; test with edge cases"
+        tech_stack:
+          - "FastAPI"
+          - "Pydantic v2"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "builder_crud"
+
+      - id: T2.3
+        name: "Agent Config builder — advanced endpoints (§4.3.2 publish/duplicate/versions/preview/validate/import/export)"
+        tdd:
+          test: |
+            Write tests in tests/test_builder_advanced.py:
+            - POST /builder/configs/{id}/publish — creates Template from config, sets visibility
+            - POST /builder/configs/{id}/duplicate — deep copies config with new name
+            - GET /builder/configs/{id}/versions — paginated version history
+            - POST /builder/configs/{id}/preview — creates time-limited preview
+            - POST /builder/configs/validate — validates config without saving
+            - POST /builder/configs/import — import from JSON/YAML string
+            - GET /builder/configs/{id}/export — export as JSON or YAML
+          implement: |
+            Implement each endpoint in builder routes:
+            - publish: copy AgentConfig → Template, set visibility/tags/category
+            - duplicate: deep copy all JSONB fields, new UUID, append " (copy)" to name
+            - versions: query AgentConfigVersion table with pagination
+            - preview: store config with TTL in Redis, return preview_id
+            - validate: run Pydantic validation, return warnings/errors
+            - import: parse JSON/YAML, validate, save
+            - export: serialize config to JSON or YAML format
+          verify: "pytest tests/test_builder_advanced.py -v"
+          smoke_test: "All builder + market tests pass together"
+          production_test: "curl chain: create config → validate → publish → duplicate → export"
+        estimated_files: 3
+        estimated_lines: 300
+        priority: "high"
+        status: "pending"
+        dependencies: ["T2.2"]
+        context_files:
+          - path: "agent-platform/services/market/src/agentp_market/"
+            description: "Market service — add builder module"
+        verification:
+          - "Publish creates template visible in marketplace"
+          - "Duplicate creates independent copy"
+          - "Version history is accurate"
+          - "Validate catches all schema errors"
+          - "Import/export roundtrip preserves data"
+        acceptance_criteria:
+          - "All 7 advanced endpoints from §4.3.2 implemented"
+          - "Publish flow creates marketplace-ready template"
+          - "Validate returns structured errors/warnings per §4.3.2"
+        failure_modes:
+          - scenario: "Import of malformed YAML causes unhandled exception"
+            likelihood: low
+            impact: low
+            mitigation: "Wrap import parsing in try/except; return VALIDATION_ERROR"
+        tech_stack:
+          - "FastAPI"
+          - "Pydantic v2"
+          - "PyYAML"
+          - "Redis"
+          - "pytest"
+        test_coverage: "builder_advanced"
+    acceptance_criteria:
+      - "Marketplace fully persisted (no in-memory state)"
+      - "All 11 builder endpoints (§4.3.2) implemented and tested"
+      - "All 7 marketplace browse endpoints (§4.4) implemented and tested"
+      - "Config validation covers all 11 dimensions from §4.3.1"
+    estimated_effort: "L"
+
+  # ============================================================================
+  # P3: BILLING SERVICE COMPLETION (detailed)
+  # ============================================================================
+  - id: M3-billing-completion
+    phase: P3
+    name: "Billing Service Completion"
+    description: "Complete billing service to api-protocol §4.5 — budget management, CSV export, billing rules API, multi-level org aggregation"
+    agent: gem-implementer
+    tasks:
+      - id: T3.1
+        name: "Budget management (§4.5 GET/PUT /billing/budget)"
+        tdd:
+          test: |
+            Write tests in tests/test_billing_budget.py:
+            - GET /api/v1/billing/budget — returns threshold and alert_rules
+            - GET /api/v1/billing/budget?org_id=X — returns org-specific budget
+            - PUT /api/v1/billing/budget — set threshold and alert_rules
+            - Budget not found returns 404 with sensible default
+            - Alert rules validate structure (thresholds, channels)
+          implement: |
+            Add budget CRUD to billing service.py:
+            - get_budget(org_id) — returns Budget or creates default
+            - update_budget(org_id, threshold, alert_rules) — upsert
+            Use Budget model from T0.1.
+            Add routes for GET/PUT /billing/budget.
+          verify: "pytest tests/test_billing_budget.py -v"
+          smoke_test: "pytest tests/test_health_billing.py — billing health check passes"
+          production_test: "curl: set budget → get budget → verify values match"
+        estimated_files: 2
+        estimated_lines: 120
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.2"]
+        context_files:
+          - path: "agent-platform/services/billing/src/agentp_billing/service.py"
+            description: "Existing billing service — add budget functions"
+        verification:
+          - "Budget CRUD works correctly"
+          - "Default budget created on first access"
+          - "Alert rules stored and retrieved as JSONB"
+        acceptance_criteria:
+          - "GET/PUT /billing/budget match §4.5"
+          - "Budget uses Budget model from shared"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "billing_budget"
+
+      - id: T3.2
+        name: "CSV export (§4.5 GET /billing/export)"
+        tdd:
+          test: |
+            Write tests in tests/test_billing_export.py:
+            - GET /billing/export?start_date=...&end_date=...&format=csv
+            - Returns Content-Type: text/csv
+            - CSV headers: time, instance_name, model, input_tokens, output_tokens, cost
+            - Date range filter works correctly
+            - Empty result returns CSV with headers only
+          implement: |
+            Add export function to billing service.py:
+            - Query usage_records with date range filter
+            - Format as CSV with StreamingResponse
+            - Support start_date, end_date query params
+          verify: "pytest tests/test_billing_export.py -v"
+          smoke_test: "Existing billing tests still pass"
+          production_test: "curl: create usage records → export CSV → verify file content"
+        estimated_files: 2
+        estimated_lines: 100
+        priority: "high"
+        status: "pending"
+        dependencies: ["T3.1"]
+        context_files:
+          - path: "agent-platform/services/billing/src/agentp_billing/service.py"
+            description: "Existing billing service — add export function"
+        verification:
+          - "CSV response has correct headers"
+          - "Date range filtering works"
+          - "Streaming response handles large datasets"
+        acceptance_criteria:
+          - "GET /billing/export returns CSV per §4.5"
+          - "Date range filter functional"
+        failure_modes:
+          - scenario: "Large CSV export causes memory issues"
+            likelihood: low
+            impact: medium
+            mitigation: "Use StreamingResponse with chunked DB reads"
+        tech_stack:
+          - "FastAPI"
+          - "csv"
+          - "pytest"
+        test_coverage: "billing_export"
+
+      - id: T3.3
+        name: "Billing rules API"
+        tdd:
+          test: |
+            Write tests in tests/test_billing_rules.py:
+            - GET /api/v1/billing/rules — list rules with model filter
+            - POST /api/v1/billing/rules — create rule (model, prices, effective dates)
+            - PUT /api/v1/billing/rules/{id} — update prices
+            - Cannot create duplicate rule for same org+model
+          implement: |
+            Add billing rule CRUD to billing service.py.
+            Use existing BillingRule model.
+            Add routes for billing rules.
+          verify: "pytest tests/test_billing_rules.py -v"
+          smoke_test: "Existing billing tests pass"
+          production_test: "curl: create rule → list → update → verify"
+        estimated_files: 2
+        estimated_lines: 100
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T3.1"]
+        context_files:
+          - path: "agent-platform/services/billing/src/agentp_billing/service.py"
+            description: "Existing billing service — add rules CRUD"
+        verification:
+          - "Rule CRUD works correctly"
+          - "Duplicate org+model prevented"
+          - "Effective date range filtering works"
+        acceptance_criteria:
+          - "Billing rules CRUD endpoints functional"
+          - "Uses existing BillingRule model"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "billing_rules"
+
+      - id: T3.4
+        name: "Multi-level org aggregation and budget alerts"
+        tdd:
+          test: |
+            Write tests in tests/test_billing_aggregation.py:
+            - GET /billing/summary aggregates costs from child orgs
+            - by_instance, by_model, daily_trend all work with org hierarchy
+            - Budget alert triggered when usage exceeds threshold
+            - Alert publishes billing.alert event to EventBus
+          implement: |
+            Enhance billing summary to support org hierarchy:
+            - Recursive CTE query to aggregate from child orgs
+            - Budget threshold check on usage record creation
+            - Alert trigger via EventBus when threshold exceeded
+          verify: "pytest tests/test_billing_aggregation.py -v"
+          smoke_test: "Full billing test suite passes"
+          production_test: "curl: query summary for parent org → verify child org costs included"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T3.2", "T3.3"]
+        context_files:
+          - path: "agent-platform/services/billing/src/agentp_billing/service.py"
+            description: "Existing billing service — enhance summary"
+        verification:
+          - "Parent org summary includes all child org data"
+          - "Budget alert fires at threshold"
+          - "Alert event published to Redis"
+        acceptance_criteria:
+          - "Summary endpoint supports org hierarchy aggregation"
+          - "Budget alert mechanism functional"
+          - "Alert events publishable to EventBus"
+        failure_modes:
+          - scenario: "Deep org hierarchy causes slow recursive queries"
+            likelihood: low
+            impact: medium
+            mitigation: "Limit hierarchy depth to 5 levels; use materialized path if needed"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "billing_aggregation"
+    acceptance_criteria:
+      - "All §4.5 billing endpoints implemented and tested"
+      - "Budget management, CSV export, billing rules, org aggregation all functional"
+      - "Budget alert mechanism triggers correctly"
+    estimated_effort: "M"
+
+  # ============================================================================
+  # P4: MEMORY SERVICE ENHANCEMENT (outlined)
+  # ============================================================================
+  - id: M4-memory-enhancement
+    phase: P4
+    name: "Memory Service Enhancement"
+    description: "Extend memory service — binary file support, keyword search, tree browse, large file/chunked upload"
+    agent: gem-implementer
+    tasks:
+      - id: T4.1
+        name: "Binary file upload/download (§4.8 PUT/GET assets)"
+        tdd:
+          test: |
+            Write tests in tests/test_memory_binary.py:
+            - PUT /api/v1/memory/assets/{path} with multipart/form-data — stores binary file
+            - GET /api/v1/memory/assets/{path} — returns file stream with correct Content-Type
+            - Content-Type detection: .png → image/png, .json → application/json, .zip → application/zip
+            - File size stored in metadata (MemoryAsset.size updated)
+            - Upload with duplicate path overwrites (or returns 409 CONFLICT)
+            - Download non-existent path returns 404
+            - Upload zero-byte file accepted
+          implement: |
+            1. Extend MemoryAsset model: add `size` (BigInteger), `content_type` (String), `storage_path` (String — filesystem location)
+            2. Modify memory service.py:
+               - PUT endpoint uses FastAPI UploadFile, saves to filesystem under configurable storage root
+               - Records metadata (path, size, content_type, storage_path) in PostgreSQL
+               - GET endpoint reads from filesystem, returns StreamingResponse with Content-Type header
+            3. Add storage root config (default: ./data/memory/)
+            4. Mimetype detection via python-magic or mimetypes stdlib
+          verify: "pytest tests/test_memory_binary.py -v"
+          smoke_test: "pytest tests/test_health_memory.py — health check passes"
+          production_test: |
+            curl -X PUT -F 'file=@test.png' http://localhost:8004/api/v1/memory/assets/org-root/test/test.png
+            curl -o downloaded.png http://localhost:8004/api/v1/memory/assets/org-root/test/test.png
+            Verify files match via checksum
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.2"]
+        context_files:
+          - path: "agent-platform/services/memory/src/agentp_memory/service.py"
+            description: "Existing memory service — extend for binary support"
+          - path: "agent-platform/services/memory/src/agentp_memory/config.py"
+            description: "Memory config — add storage_root setting"
+          - path: "agent-platform/services/shared/src/agentp_shared/models.py"
+            description: "MemoryAsset model — add size, content_type, storage_path columns"
+        verification:
+          - "Binary files upload and download correctly"
+          - "Content-Type auto-detected and returned"
+          - "File size metadata accurate"
+          - "Overwrite behavior correct"
+        acceptance_criteria:
+          - "PUT /memory/assets/{path} with multipart/form-data per §4.8"
+          - "GET /memory/assets/{path} returns StreamingResponse with correct Content-Type"
+          - "Filesystem storage path configurable via MEMORY_STORAGE_ROOT env var"
+        failure_modes:
+          - scenario: "Large file upload causes OOM or timeout"
+            likelihood: medium
+            impact: medium
+            mitigation: "Stream to disk via UploadFile.file (not read into memory); configurable max_upload_size"
+          - scenario: "Storage directory permissions issue on Windows"
+            likelihood: medium
+            impact: low
+            mitigation: "Create storage_root on first upload if not exists; log warning on permission error"
+        tech_stack:
+          - "FastAPI"
+          - "python-multipart"
+          - "pytest"
+          - "httpx"
+        test_coverage: "memory_binary"
+
+      - id: T4.2
+        name: "Tree browse endpoint (§4.8 GET assets with recursive listing)"
+        tdd:
+          test: |
+            Write tests in tests/test_memory_tree.py:
+            - GET /api/v1/memory/assets?path=org-root/skills&recursive=true
+            - Returns hierarchical tree: { "items": [{ "path": "...", "name": "...", "type": "file|dir", "size": ..., "updated_at": "..." }] }
+            - Without recursive=true: only direct children of path
+            - Empty path: lists root-level entries
+            - Non-existent path: returns empty list (not 404)
+            - Pagination: page + page_size works on top-level entries
+            - Directory entries have type="dir" and size=0
+            - Entries sorted by type (dirs first) then name alphabetically
+          implement: |
+            Add tree browse to memory service.py:
+            - Query MemoryAsset table with path prefix matching
+            - If recursive=false: filter by immediate parent path
+            - If recursive=true: all descendants of path prefix
+            - Group by directory segments to infer directory entries
+            - Return flat list with type field (infer directories from path separators)
+          verify: "pytest tests/test_memory_tree.py -v"
+          smoke_test: "Full memory test suite passes (test_memory.py + test_memory_binary.py + test_memory_tree.py)"
+          production_test: |
+            Create nested assets: org-root/a/b/1.txt, org-root/a/b/2.txt, org-root/a/c/3.txt
+            GET /memory/assets?path=org-root/a&recursive=true → returns 4 items (a/b dir, a/c dir, 3 files)
+            GET /memory/assets?path=org-root/a&recursive=false → returns 2 items (b dir, c dir)
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T4.1"]
+        context_files:
+          - path: "agent-platform/services/memory/src/agentp_memory/service.py"
+            description: "Existing memory service — add tree browse"
+        verification:
+          - "Tree returns correct hierarchical structure"
+          - "Recursive flag controls depth"
+          - "Directory entries inferred correctly"
+          - "Pagination works on flat list"
+        acceptance_criteria:
+          - "GET /memory/assets matches §4.8 response format"
+          - "recursive query parameter controls traversal depth"
+          - "Entries sorted: directories first, then alphabetical"
+        failure_modes:
+          - scenario: "Deep directory tree causes slow query"
+            likelihood: low
+            impact: medium
+            mitigation: "LIKE query on path column with index; limit recursive depth"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "memory_tree"
+
+      - id: T4.3
+        name: "Keyword search endpoint (§4.8 GET /memory/search)"
+        tdd:
+          test: |
+            Write tests in tests/test_memory_search.py:
+            - GET /api/v1/memory/search?keyword=python&page=1&page_size=20
+            - Matches against asset name (ILIKE) and path (ILIKE)
+            - Returns paginated results: { "items": [...], "total": N, "page": 1, "page_size": 20 }
+            - Empty keyword returns 422 VALIDATION_ERROR
+            - No matches returns empty list with total=0
+            - Search is case-insensitive
+            - Special characters in keyword escaped (SQL injection safe)
+          implement: |
+            Add search endpoint to memory service.py:
+            - Accept keyword query parameter (required, min 1 char)
+            - Query: SELECT * FROM memory_assets WHERE path ILIKE '%keyword%' OR name ILIKE '%keyword%'
+            - Apply pagination
+            - Return paginated response per api-protocol §1.4
+          verify: "pytest tests/test_memory_search.py -v"
+          smoke_test: "Full memory test suite passes"
+          production_test: |
+            Create assets with names containing "python", "review", "config"
+            GET /memory/search?keyword=python → returns only matching assets
+            GET /memory/search?keyword=NONEXISTENT → returns empty list
+        estimated_files: 2
+        estimated_lines: 100
+        priority: "high"
+        status: "pending"
+        dependencies: ["T4.2"]
+        context_files:
+          - path: "agent-platform/services/memory/src/agentp_memory/service.py"
+            description: "Existing memory service — add search"
+        verification:
+          - "Keyword matches against name and path"
+          - "Case-insensitive search"
+          - "Pagination correct"
+          - "SQL injection safe"
+        acceptance_criteria:
+          - "GET /memory/search matches §4.8"
+          - "Case-insensitive ILIKE matching"
+          - "Paginated response format"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "memory_search"
+    acceptance_criteria:
+      - "Binary file upload/download functional with Content-Type detection"
+      - "Tree browse with recursive flag per §4.8"
+      - "Keyword search with pagination per §4.8"
+      - "All existing memory tests still pass (no regressions)"
+    estimated_effort: "S"
+    note: "MemoryAsset already has content_type, size_bytes, storage_ref columns — only need service layer changes. T4.1, T4.2, T4.3 are independent (all depend only on T0.2)."
+
+  # ============================================================================
+  # P5: SCHEDULER BUSINESS ORCHESTRATION (outlined)
+  # ============================================================================
+  - id: M5-scheduler-orchestration
+    phase: P5
+    name: "Scheduler Business Orchestration"
+    description: "Transform scheduler from HTTP proxy to business orchestration hub — service registry, approval workflow, instance lifecycle, config center, Celery tasks"
+    agent: gem-implementer
+    tasks:
+      - id: T5.1
+        name: "Service registry with health checks"
+        tdd:
+          test: |
+            Write tests in tests/test_scheduler_registry.py:
+            - ServiceRegistry class: register(name, url, health_url) stores in Redis hash
+            - heartbeat(name) updates last_heartbeat timestamp
+            - is_healthy(name) returns True if heartbeat within threshold (e.g., 30s)
+            - get_service(name) returns service URL or raises SERVICE_UNAVAILABLE
+            - deregister(name) removes from registry
+            - list_services() returns all registered services with health status
+            - Stale services (no heartbeat > threshold) auto-flagged as unhealthy
+          implement: |
+            Create services/shared/src/agentp_shared/registry.py:
+            - ServiceRegistry class using Redis HSET/HGET for service entries
+            - Each entry: { url, health_url, last_heartbeat, status }
+            - Health check method that calls /health endpoint and updates status
+            - Auto-deregistration on consecutive health check failures (configurable threshold)
+            Replace scheduler's static ROUTE_TABLE with ServiceRegistry lookups.
+            Each service adds registry.register() in lifespan startup and heartbeat in background task.
+          verify: "pytest tests/test_scheduler_registry.py -v"
+          smoke_test: "pytest tests/test_health_scheduler.py — scheduler health check passes"
+          production_test: |
+            Start all 7 services → verify registry populated via Redis CLI (HKEYS service_registry)
+            Stop one service → wait >30s → verify auto-flagged unhealthy
+            Restart → verify re-registered
+        estimated_files: 3
+        estimated_lines: 250
+        priority: "high"
+        status: "pending"
+        dependencies: ["T0.2"]
+        context_files:
+          - path: "agent-platform/services/scheduler/src/agentp_scheduler/"
+            description: "Current scheduler — replace proxy ROUTE_TABLE with registry"
+          - path: "agent-platform/services/shared/src/agentp_shared/config.py"
+            description: "Config — add REGISTRY_HEARTBEAT_INTERVAL, REGISTRY_STALE_THRESHOLD"
+        verification:
+          - "Services register on startup"
+          - "Health check marks unhealthy services"
+          - "Routing uses registry instead of static table"
+          - "Auto-deregistration on consecutive failures"
+        acceptance_criteria:
+          - "ServiceRegistry in shared library, used by all services"
+          - "Dynamic routing replaces hardcoded ROUTE_TABLE"
+          - "Heartbeat interval and stale threshold configurable via env vars"
+        failure_modes:
+          - scenario: "Redis failure causes all services to appear unhealthy"
+            likelihood: low
+            impact: high
+            mitigation: "Graceful degradation — route to last known good URL; log Redis connection errors"
+          - scenario: "Registry race condition on service startup"
+            likelihood: low
+            impact: low
+            mitigation: "Use Redis WATCH/MULTI or HSETNX for atomic register"
+        tech_stack:
+          - "FastAPI"
+          - "Redis"
+          - "pytest"
+          - "httpx"
+        test_coverage: "scheduler_registry"
+
+      - id: T5.2
+        name: "Approval workflow (§4.7)"
+        tdd:
+          test: |
+            Write tests in tests/test_scheduler_approvals.py:
+            - GET /api/v1/approvals — list with status filter (pending/approved/rejected) and pagination
+            - GET /api/v1/approvals/history — list with date range filter, all statuses
+            - POST /api/v1/approvals/{id}/approve — transitions pending→approved, sets reviewed_by/reviewed_at
+            - POST /api/v1/approvals/{id}/reject — transitions pending→rejected, requires reason
+            - Cannot approve already-approved request (409)
+            - Cannot reject without reason (422)
+            - Non-admin cannot approve/reject (403)
+            - Approval creation triggered by scheduler when instance request requires approval (org policy)
+          implement: |
+            Create services/scheduler/src/agentp_scheduler/approval_service.py:
+            - list_approvals(org_id, status, page, page_size)
+            - create_approval(org_id, applicant_id, template_name, config_summary, reason)
+            - approve(approval_id, reviewer_id)
+            - reject(approval_id, reviewer_id, reason)
+            - get_approval_history(org_id, date_from, date_to, page, page_size)
+            Add routes per §4.7.
+            Use Approval model from T0.1.
+            Check RBAC: only org admin or higher can approve/reject.
+          verify: "pytest tests/test_scheduler_approvals.py -v"
+          smoke_test: "Full scheduler test suite passes"
+          production_test: |
+            curl login as admin → create approval via internal API → list → approve → verify status changed
+            curl login as member → attempt approve → expect 403
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.1", "T1.3"]
+        context_files:
+          - path: "agent-platform/services/scheduler/src/agentp_scheduler/"
+            description: "Scheduler service — add approval module"
+          - path: "agent-platform/services/shared/src/agentp_shared/models.py"
+            description: "Approval model from T0.1"
+        verification:
+          - "Approval CRUD works"
+          - "Status transitions enforced (pending→approved, pending→rejected)"
+          - "RBAC: only admin can approve/reject"
+          - "History endpoint with date range filter"
+        acceptance_criteria:
+          - "All §4.7 approval endpoints implemented"
+          - "Status machine enforced: pending → approved | rejected (no reverse)"
+          - "Reviewer audit trail (reviewed_by, reviewed_at)"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "scheduler_approvals"
+
+      - id: T5.3
+        name: "Instance lifecycle management (§6.5)"
+        tdd:
+          test: |
+            Write tests in tests/test_scheduler_lifecycle.py:
+            - create_instance_with_checks: verifies org quota before calling host service
+            - quota_exceeded: returns QUOTA_EXCEEDED when org has max instances
+            - idle_detection: marks instances idle when last_active_at > threshold
+            - auto_reclaim_idle: reclaims idle instances, updates status to stopped
+            - status_aggregation: GET /agents returns instances from all host nodes
+            - instance_created_event: publishes agent.created event to EventBus
+            - instance_destroyed_event: publishes agent.destroyed event to EventBus
+          implement: |
+            Create services/scheduler/src/agentp_scheduler/lifecycle.py:
+            - InstanceLifecycleManager class
+            - check_quota(org_id) → query instance count vs org.quota
+            - detect_idle_instances(threshold_minutes) → query last_active_at
+            - reclaim_instance(instance_id) → call host destroy, update status
+            - aggregate_status() → query host services for instance lists, merge
+            Enhance scheduler's create_agent endpoint to check quota before forwarding to host.
+            Publish events via EventBus on state changes.
+          verify: "pytest tests/test_scheduler_lifecycle.py -v"
+          smoke_test: "Full scheduler test suite passes"
+          production_test: |
+            Create instances up to quota → verify QUOTA_EXCEEDED on next create
+            Set one instance last_active_at to past → run idle detection → verify reclaimed
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.2"]
+        context_files:
+          - path: "agent-platform/services/scheduler/src/agentp_scheduler/"
+            description: "Scheduler — add lifecycle manager"
+          - path: "agent-platform/services/shared/src/agentp_shared/event_bus.py"
+            description: "EventBus — publish events on state changes"
+        verification:
+          - "Quota check prevents over-provisioning"
+          - "Idle instances detected and reclaimed"
+          - "Cross-node status aggregation works"
+          - "Events published on create/destroy/reclaim"
+        acceptance_criteria:
+          - "Quota enforced before instance creation"
+          - "Idle detection configurable via threshold env var"
+          - "Auto-reclamation updates DB status and publishes event"
+          - "Status aggregation merges data from multiple host nodes"
+        failure_modes:
+          - scenario: "Host service down during reclamation"
+            likelihood: medium
+            impact: medium
+            mitigation: "Mark instance as 'stopping' first; retry via Celery if host unavailable"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "scheduler_lifecycle"
+
+      - id: T5.4
+        name: "Celery integration — async tasks (§9.1.1)"
+        tdd:
+          test: |
+            Write tests in tests/test_scheduler_celery.py:
+            - Celery app configures Redis as broker/backend
+            - create_instance_task: accepts instance config, calls host service, returns task_id
+            - recycle_idle_instances_task: queries idle instances, calls reclaim for each
+            - generate_daily_report_task: queries billing data for org, stores result
+            - Task status queryable via GET /api/v1/tasks/{task_id} per §4.9
+            - Task failure retries up to max_retries with exponential backoff
+            - Task uses NullPool for DB connections (no stale connection issues)
+          implement: |
+            Create services/scheduler/src/agentp_scheduler/tasks.py:
+            - Celery app: Celery("agentp_scheduler", broker=redis_url, backend=redis_url)
+            - create_instance_task(instance_config, ctx): calls host service, updates DB status
+            - recycle_idle_instances_task(): periodic task, reclaims idle instances
+            - generate_daily_report_task(org_id): aggregates billing, stores TaskRecord
+            - health_check_all_task(): checks all registered services, updates status
+            Task functions create fresh DB engines per execution (NullPool pattern).
+            Create services/scheduler/src/agentp_scheduler/beat_schedule.py:
+            - recycle_idle: every hour
+            - daily_report: every day at 00:00
+            - health_check: every 5 minutes
+            Add GET /api/v1/tasks/{task_id} route that queries Celery backend for status.
+          verify: "pytest tests/test_scheduler_celery.py -v"
+          smoke_test: "Full scheduler test suite passes"
+          production_test: |
+            Submit task via API → check status (GET /tasks/{id}) → verify completed
+            Start celery worker + beat → verify scheduled tasks execute
+        estimated_files: 4
+        estimated_lines: 300
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.3"]
+        context_files:
+          - path: "agent-platform/services/scheduler/"
+            description: "Scheduler service — add Celery tasks and beat schedule"
+        verification:
+          - "Celery tasks execute successfully with Redis broker"
+          - "Task status queryable via REST API per §4.9"
+          - "Retry logic works on transient failures"
+          - "NullPool prevents event loop issues"
+        acceptance_criteria:
+          - "Celery worker processes async tasks (create_instance, recycle, report, health_check)"
+          - "Celery Beat runs scheduled tasks per beat_schedule"
+          - "GET /api/v1/tasks/{task_id} matches §4.9 response format"
+          - "Tasks use NullPool for DB connections"
+        failure_modes:
+          - scenario: "Celery task holds stale DB connection (event loop issue)"
+            likelihood: high
+            impact: medium
+            mitigation: "Use NullPool; create fresh engine per task execution (from debugging notes)"
+          - scenario: "Redis broker unavailable causes task queue backup"
+            likelihood: low
+            impact: high
+            mitigation: "Monitor queue length; alert on backlog; dead letter queue for failed tasks"
+        tech_stack:
+          - "Celery"
+          - "Redis"
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "scheduler_celery"
+
+      - id: T5.5
+        name: "Configuration center (§6.6) — DEFERRED TO POST-MVP"
+        tdd:
+          test: |
+            [Deferred] This task is postponed. For now, use env vars + pydantic-settings.
+            When reactivated:
+            - GET /internal/config — returns system defaults
+            - GET /internal/config?org_id=X — returns org-level overrides merged with defaults
+            - PUT /internal/config (admin) — update system defaults
+            - Instance inherits: system defaults → org overrides → instance config
+          implement: |
+            [Deferred] Configuration center postponed to post-MVP.
+            Current approach: use pydantic-settings with AGENTP_ env var prefix (already in use).
+            When reactivated: use Redis hash for config storage, config.changed events via EventBus.
+            Note: endpoints should be /internal/config (not in api-protocol §4.x) to avoid scope creep.
+          verify: "N/A (deferred)"
+          smoke_test: "N/A (deferred)"
+          production_test: "N/A (deferred)"
+            GET /config?org_id=org-root → verify merged result
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T5.4"]
+        context_files:
+          - path: "agent-platform/services/scheduler/src/agentp_scheduler/"
+            description: "Scheduler — add config center"
+        verification:
+          - "Three-level config hierarchy works"
+          - "Hot-reload without restart"
+          - "Version tracking per change"
+        acceptance_criteria:
+          - "Config center supports system/org/instance levels"
+          - "Merge logic: instance > org > system"
+          - "Hot-reload via EventBus config.changed event"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "Redis"
+          - "pytest"
+        test_coverage: "scheduler_config"
+    acceptance_criteria:
+      - "Scheduler has real business logic (not just proxy)"
+      - "Dynamic service registry with health checks replaces static ROUTE_TABLE"
+      - "Approval workflow from §4.7 fully implemented"
+      - "Instance lifecycle management with quota enforcement and idle detection"
+      - "Celery tasks for async operations with NullPool pattern"
+      - "Configuration center DEFERRED to post-MVP — use env vars + pydantic-settings"
+    estimated_effort: "L"
+    note: "Dependencies relaxed: only P0+P1 needed (was P1+P2+P3+P4). Config center deferred."
+
+  # ============================================================================
+  # P6: GATEWAY PRODUCTION HARDENING (outlined)
+  # ============================================================================
+  - id: M6-gateway-hardening
+    phase: P6
+    name: "Gateway Production Hardening"
+    description: "Add production features to gateway — rate limiting, CORS, audit logs, circuit breaker, WebSocket streaming"
+    agent: gem-implementer
+    tasks:
+      - id: T6.1
+        name: "Redis-based rate limiting (§7.4)"
+        tdd:
+          test: |
+            Write tests in tests/test_gateway_ratelimit.py:
+            - Global rate limit: requests exceed GATEWAY_RATE_LIMIT → 429 with retry_after
+            - Per-org rate limit: each org has GATEWAY_ORG_RATE_LIMIT → 429 when exceeded
+            - Per-user rate limit: each user has GATEWAY_USER_RATE_LIMIT → 429 when exceeded
+            - Per-endpoint rate limit: /api/v1/agents POST has lower limit → 429
+            - Rate limit headers in response: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset
+            - Sliding window algorithm using Redis INCR + EXPIRE
+            - Health check /health bypasses rate limiting
+          implement: |
+            Create services/shared/src/agentp_shared/rate_limiter.py:
+            - RedisSlidingWindowLimiter class using Redis INCR + EXPIRE
+            - check_limit(key: str, limit: int, window_seconds: int) -> (allowed: bool, remaining: int, reset_at: int)
+            Add rate limiting middleware to gateway:
+            - 4 levels: global, per-org (X-Tenant-ID), per-user (X-User-ID), per-endpoint
+            - Configurable via env vars: GATEWAY_RATE_LIMIT, GATEWAY_ORG_RATE_LIMIT, GATEWAY_USER_RATE_LIMIT
+            - Returns 429 RATE_LIMITED with { retry_after: N } per api-protocol §2.3
+            - Adds X-RateLimit-* headers to all responses
+          verify: "pytest tests/test_gateway_ratelimit.py -v"
+          smoke_test: "pytest tests/test_health_gateway.py — gateway health still passes"
+          production_test: |
+            Send N+1 requests rapidly → verify 429 on N+1th request
+            Wait for window reset → verify request succeeds
+            Verify X-RateLimit-* headers in response
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.1"]
+        context_files:
+          - path: "agent-platform/services/gateway/src/agentp_gateway/"
+            description: "Gateway — add rate limiting middleware"
+          - path: "agent-platform/services/shared/src/agentp_shared/"
+            description: "Shared — add rate limiter utility"
+        verification:
+          - "4 returned after N+1 requests within window"
+          - "X-RateLimit-* headers present"
+          - "Health check bypasses rate limit"
+          - "Per-org and per-user limits work independently"
+        acceptance_criteria:
+          - "4-level rate limiting: global, org, user, endpoint"
+          - "Redis sliding window algorithm"
+          - "429 response matches api-protocol §2.3 RATE_LIMITED error format"
+          - "Configurable limits via env vars"
+        failure_modes:
+          - scenario: "Redis connection timeout causes all requests to fail"
+            likelihood: low
+            impact: high
+            mitigation: "If Redis unavailable, allow all requests (fail-open) with warning log"
+        tech_stack:
+          - "FastAPI"
+          - "Redis"
+          - "pytest"
+          - "httpx"
+        test_coverage: "gateway_ratelimit"
+
+      - id: T6.2
+        name: "CORS configuration"
+        tdd:
+          test: |
+            Write tests in tests/test_gateway_cors.py:
+            - OPTIONS preflight request returns CORS headers
+            - Access-Control-Allow-Origin matches GATEWAY_CORS_ORIGINS
+            - Access-Control-Allow-Methods, Allow-Headers set correctly
+            - Non-listed origin gets no CORS headers
+            - Credentials allowed when configured
+          implement: |
+            Add CORSMiddleware to gateway with configurable origins:
+            - GATEWAY_CORS_ORIGINS env var (comma-separated, default: "*")
+            - Allow methods: GET, POST, PUT, DELETE, PATCH, OPTIONS
+            - Allow headers: Authorization, Content-Type, X-OH-API-Key
+            - Development mode: allow all origins
+            - Production mode: restrict to configured origins
+          verify: "pytest tests/test_gateway_cors.py -v"
+          smoke_test: "Existing gateway tests pass"
+          production_test: |
+            curl -X OPTIONS -H 'Origin: http://localhost:5173' http://localhost:8000/api/v1/agents
+            Verify Access-Control-Allow-Origin header
+        estimated_files: 2
+        estimated_lines: 80
+        priority: "high"
+        status: "pending"
+        dependencies: ["T6.1"]
+        context_files:
+          - path: "agent-platform/services/gateway/src/agentp_gateway/"
+            description: "Gateway — add CORS middleware"
+        verification:
+          - "CORS headers correct for configured origins"
+          - "Non-listed origins rejected"
+        acceptance_criteria:
+          - "CORS configurable via GATEWAY_CORS_ORIGINS"
+          - "Dev mode allows all, prod mode restricts"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI CORSMiddleware"
+          - "pytest"
+        test_coverage: "gateway_cors"
+
+      - id: T6.3
+        name: "Audit logging (§7.5)"
+        tdd:
+          test: |
+            Write tests in tests/test_gateway_audit.py:
+            - Every request creates audit log entry in database
+            - Entry contains: timestamp, source_ip, api_key_id, user_id, org_id, method, path, query_params, status_code, latency_ms, request_id
+            - Sensitive fields in query_params auto-masked (api_key → ****, password → ****)
+            - Health check /health NOT logged (configurable skip paths)
+            - Audit log queryable (not via gateway, but direct DB)
+          implement: |
+            Create AuditLog model in shared/models.py:
+            - id, timestamp, source_ip, api_key_id, user_id, org_id, method, path, query_params (JSONB), status_code, latency_ms, request_id
+            Add audit middleware to gateway:
+            - After response, insert AuditLog record via async DB session
+            - Mask sensitive fields in query_params before storage
+            - Skip paths from GATEWAY_AUDIT_SKIP_PATHS env var (default: /health)
+            - Non-blocking: fire-and-forget insert (don't block response)
+          verify: "pytest tests/test_gateway_audit.py -v"
+          smoke_test: "Full gateway test suite passes"
+          production_test: |
+            Make requests → query audit_logs table → verify entries created
+            Verify sensitive fields masked
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T6.2"]
+        context_files:
+          - path: "agent-platform/services/gateway/src/agentp_gateway/"
+            description: "Gateway — add audit middleware"
+          - path: "agent-platform/services/shared/src/agentp_shared/models.py"
+            description: "Shared models — add AuditLog"
+        verification:
+          - "Audit entries created for every request"
+          - "Sensitive fields masked"
+          - "Health check skipped"
+          - "Non-blocking (doesn't increase response latency)"
+        acceptance_criteria:
+          - "Audit log per §7.5: timestamp, IP, API key, path, status, latency"
+          - "Sensitive field masking"
+          - "Configurable skip paths"
+        failure_modes:
+          - scenario: "High QPS causes audit log DB bottleneck"
+            likelihood: medium
+            impact: medium
+            mitigation: "Non-blocking insert; batch writes if needed; consider separate audit DB in future"
+        tech_stack:
+          - "FastAPI"
+          - "SQLAlchemy async"
+          - "pytest"
+        test_coverage: "gateway_audit"
+
+      - id: T6.4
+        name: "Circuit breaker (§7.4)"
+        tdd:
+          test: |
+            Write tests in tests/test_gateway_circuit.py:
+            - Circuit breaker starts in CLOSED state (normal operation)
+            - After N consecutive failures → transitions to OPEN (returns 503 SERVICE_UNAVAILABLE)
+            - After timeout → transitions to HALF_OPEN (allows 1 probe request)
+            - Probe succeeds → CLOSED; probe fails → OPEN
+            - Circuit breaker state tracked per downstream service
+            - Open state response: { code: "SERVICE_UNAVAILABLE", details: { retry_after: N, service: "host" } }
+          implement: |
+            Create services/shared/src/agentp_shared/circuit_breaker.py:
+            - CircuitBreaker class with states: CLOSED, OPEN, HALF_OPEN
+            - track_success(service_name) / track_failure(service_name)
+            - is_open(service_name) -> bool
+            - Configurable: failure_threshold (default 5), recovery_timeout (default 30s), half_open_max_probes (default 1)
+            Integrate with gateway proxy: wrap downstream calls in circuit breaker
+            Track failures from httpx ConnectError, TimeoutException, 5xx responses
+          verify: "pytest tests/test_gateway_circuit.py -v"
+          smoke_test: "Full gateway test suite passes"
+          production_test: |
+            Stop downstream service → send requests → verify circuit opens (503)
+            Wait recovery_timeout → verify half-open allows probe
+            Restart downstream → verify circuit closes
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T6.3"]
+        context_files:
+          - path: "agent-platform/services/gateway/src/agentp_gateway/"
+            description: "Gateway — integrate circuit breaker"
+        verification:
+          - "State transitions: CLOSED → OPEN → HALF_OPEN → CLOSED"
+          - "Per-service circuit breaker isolation"
+          - "503 response matches api-protocol §2.3"
+        acceptance_criteria:
+          - "Circuit breaker per downstream service"
+          - "Configurable thresholds via env vars"
+          - "503 SERVICE_UNAVAILABLE with retry_after per §2.3"
+        failure_modes:
+          - scenario: "Circuit breaker opens prematurely due to transient errors"
+            likelihood: medium
+            impact: medium
+            mitigation: "Only count 5xx and connection errors; ignore 4xx client errors"
+        tech_stack:
+          - "FastAPI"
+          - "httpx"
+          - "pytest"
+        test_coverage: "gateway_circuit"
+
+      - id: T6.5
+        name: "WebSocket streaming endpoint (§1.6, §4.2)"
+        tdd:
+          test: |
+            Write tests in tests/test_gateway_websocket.py:
+            - WS connect to /api/v1/agents/{id}/stream?token=<jwt> — authenticates via JWT
+            - Invalid/expired token → connection rejected (1008)
+            - Valid token but non-existent instance → connection rejected (1008)
+            - Valid connection → proxy WebSocket to host service
+            - Messages forwarded bidirectionally (client ↔ host)
+            - Connection close propagates to host
+          implement: |
+            Add WebSocket route to gateway:
+            - ws://gateway/agents/{id}/stream?token=<jwt>
+            - Validate JWT from query parameter
+            - Proxy WebSocket connection to host service: ws://host:8002/internal/instances/{id}/stream
+            - Use Starlette WebSocket for handling
+          verify: "pytest tests/test_gateway_websocket.py -v"
+          smoke_test: "Full gateway test suite passes"
+          production_test: |
+            Use wscat or websocat to connect:
+            wscat -c "ws://localhost:8000/api/v1/agents/{id}/stream?token=<jwt>"
+            Send message → receive response
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T6.4"]
+        context_files:
+          - path: "agent-platform/services/gateway/src/agentp_gateway/"
+            description: "Gateway — add WebSocket proxy"
+        verification:
+          - "JWT auth via query parameter"
+          - "WebSocket proxy to host service"
+          - "Bidirectional message forwarding"
+        acceptance_criteria:
+          - "WS /api/v1/agents/{id}/stream per §1.6"
+          - "Authentication via ?token= query parameter"
+          - "Bidirectional proxy to host service"
+        failure_modes:
+          - scenario: "WebSocket connection leak on client disconnect"
+            likelihood: medium
+            impact: medium
+            mitigation: "Connection timeout (default 5min idle); cleanup on disconnect event"
+        tech_stack:
+          - "FastAPI"
+          - "websockets"
+          - "pytest"
+          - "httpx-ws"
+        test_coverage: "gateway_websocket"
+    acceptance_criteria:
+      - "4-level rate limiting with Redis sliding window"
+      - "CORS configurable per environment"
+      - "Audit logging with sensitive field masking"
+      - "Circuit breaker per downstream service"
+      - "WebSocket streaming proxy with JWT auth"
+    estimated_effort: "L"
+
+  # ============================================================================
+  # P7: HOST SERVICE ADVANCED OPERATIONS (outlined)
+  # ============================================================================
+  - id: M7-host-advanced
+    phase: P7
+    name: "Host Service Advanced Operations"
+    description: "Implement remaining Host endpoints from §4.2 — restart/batch, command, skills, MCP, config, monitor, memory sync, process pool model"
+    agent: gem-implementer
+    tasks:
+      - id: T7.1
+        name: "Restart, batch-restart, batch-destroy (§4.2)"
+        tdd:
+          test: |
+            Write tests in tests/test_host_restart.py:
+            - POST /api/v1/agents/{id}/restart — returns { ok: true, task_id }
+            - Instance status transitions: running → stopping → stopped → creating → running
+            - Restart on stopped instance starts it again
+            - Restart on non-existent instance returns 404
+            - POST /api/v1/agents/batch-restart { ids: [] } — returns { ok: true, task_id }
+            - Batch restart processes all IDs, returns per-item status
+            - Partial failure: some succeed, some fail → returns errors for failed items
+            - POST /api/v1/agents/batch-destroy { ids: [] } — returns { ok: true, task_id }
+            - Batch destroy removes all specified instances
+            - Empty ids array returns 422 VALIDATION_ERROR
+          implement: |
+            Add to host service:
+            - restart_instance(instance_id): call SDK restart via adapter, update DB status
+            - batch_restart(ids): iterate, collect per-item results, return aggregated status
+            - batch_destroy(ids): iterate, call SDK destroy, delete DB records
+            For async operations: submit to Celery via scheduler, return task_id
+            Batch operations update multiple records in single transaction where possible.
+          verify: "pytest tests/test_host_restart.py -v"
+          smoke_test: "pytest tests/test_health_host.py — host health check passes"
+          production_test: |
+            Create 3 instances → batch-restart → verify all restarted
+            batch-destroy → verify all removed from DB
+        estimated_files: 2
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.4"]
+        context_files:
+          - path: "agent-platform/services/host/src/agentp_host/service.py"
+            description: "Existing host service — add restart and batch operations"
+        verification:
+          - "Single restart works with status transition"
+          - "Batch operations process all items"
+          - "Partial failure handled gracefully"
+          - "Empty array validation"
+        acceptance_criteria:
+          - "POST /agents/{id}/restart, /batch-restart, /batch-destroy per §4.2"
+          - "Returns task_id for async operations"
+          - "Batch returns per-item status"
+        failure_modes:
+          - scenario: "Batch operation partially succeeds"
+            likelihood: medium
+            impact: medium
+            mitigation: "Return per-item status; rollback only failed items; log partial failures"
+        tech_stack:
+          - "FastAPI"
+          - "Celery"
+          - "pytest"
+        test_coverage: "host_restart"
+
+      - id: T7.2
+        name: "Command execution (§4.2 POST /agents/{id}/command)"
+        tdd:
+          test: |
+            Write tests in tests/test_host_command.py:
+            - POST /api/v1/agents/{id}/command { "command": "ls -la" }
+            - Returns { "output": "..." } with command output
+            - Non-existent instance returns 404
+            - Instance not in running state returns 409 CONFLICT
+            - Empty command returns 422 VALIDATION_ERROR
+            - Command timeout (configurable) returns 504 GATEWAY_TIMEOUT
+          implement: |
+            Add command execution to host service:
+            - Execute command via SDK adapter (adapter.exec_command(instance_guid, command))
+            - For noop driver: return mock output
+            - Timeout handling: configurable HOST_COMMAND_TIMEOUT env var (default 30s)
+            - Stream output support for long-running commands
+          verify: "pytest tests/test_host_command.py -v"
+          smoke_test: "Full host test suite passes"
+          production_test: |
+            Create instance → send command → verify output
+        estimated_files: 2
+        estimated_lines: 100
+        priority: "high"
+        status: "pending"
+        dependencies: ["T7.1"]
+        context_files:
+          - path: "agent-platform/services/host/src/agentp_host/service.py"
+            description: "Existing host service — add command execution"
+        verification:
+          - "Command executes and returns output"
+          - "State validation (only running instances)"
+          - "Timeout handling"
+        acceptance_criteria:
+          - "POST /agents/{id}/command per §4.2"
+          - "Returns { output: string }"
+          - "Configurable timeout"
+        failure_modes:
+          - scenario: "Command injection via malicious input"
+            likelihood: low
+            impact: high
+            mitigation: "Command runs inside sandboxed container; no shell escaping needed on host"
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "host_command"
+
+      - id: T7.3
+        name: "Skills install, MCP config, config update (§4.2)"
+        tdd:
+          test: |
+            Write tests in tests/test_host_extensions.py:
+            - POST /api/v1/agents/{id}/skills { "skill_id": "skill-uuid" }
+            - Returns { ok: true }
+            - Skill install via SDK adapter (adapter.install_skill(instance_guid, skill_id))
+            - POST /api/v1/agents/{id}/mcp { "name": "github", "transport": "http", "config": { "url": "..." } }
+            - Returns { ok: true }
+            - Invalid transport returns 422 (must be stdio|http|ws)
+            - MCP config persisted to instance DB record
+            - PUT /api/v1/agents/{id}/config { "system_prompt": "...", "model": "openai/gpt-4o" }
+            - Returns { ok: true }
+            - Config update persisted to instance record
+            - Partial update (PATCH semantics): only provided fields updated
+          implement: |
+            Add to host service:
+            - install_skill(instance_id, skill_id): call adapter, update instance skills list
+            - configure_mcp(instance_id, name, transport, config): validate transport enum, persist to instance
+            - update_config(instance_id, config): merge partial config into instance record
+            Store skills and MCP config as JSONB columns on AgentInstance model.
+          verify: "pytest tests/test_host_extensions.py -v"
+          smoke_test: "Full host test suite passes"
+          production_test: |
+            Create instance → install skill → configure MCP → update config → verify all persisted
+        estimated_files: 2
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T7.2"]
+        context_files:
+          - path: "agent-platform/services/host/src/agentp_host/service.py"
+            description: "Existing host service — add skills, MCP, config"
+        verification:
+          - "Skill install delegates to adapter"
+          - "MCP config validates transport enum"
+          - "Config update is partial (PATCH semantics)"
+          - "All changes persisted to DB"
+        acceptance_criteria:
+          - "POST /agents/{id}/skills, /agents/{id}/mcp, PUT /agents/{id}/config per §4.2"
+          - "Transport validation: stdio|http|ws"
+          - "Partial config update (PATCH semantics)"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "pytest"
+        test_coverage: "host_extensions"
+
+      - id: T7.4
+        name: "Monitor data and memory sync (§4.2)"
+        tdd:
+          test: |
+            Write tests in tests/test_host_monitor.py:
+            - GET /api/v1/agents/{id}/monitor
+            - Returns { "cpu_percent": float, "memory_mb": float, "total_tokens": int }
+            - For noop driver: returns mock values (cpu: 0.0, memory: 0.0, tokens: 0)
+            - Non-existent instance returns 404
+            - GET /api/v1/agents/{id}/memory/tree
+            - Returns { "paths": [...], "tree": { "name": "...", "children": [...] } }
+            - POST /api/v1/agents/{id}/memory/upload — multipart upload to instance memory
+            - GET /api/v1/agents/{id}/memory/download — download from instance memory
+          implement: |
+            Add to host service:
+            - get_monitor(instance_id): query SDK for resource usage
+            - get_memory_tree(instance_id): delegate to memory service (internal call)
+            - upload_memory(instance_id, file): delegate to memory service
+            - download_memory(instance_id): delegate to memory service
+            Monitor data can be cached in Redis with short TTL (30s) for performance.
+          verify: "pytest tests/test_host_monitor.py -v"
+          smoke_test: "Full host test suite passes"
+          production_test: |
+            Create instance → check monitor → upload memory → download memory → verify content
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T7.3", "T4.1"]
+        context_files:
+          - path: "agent-platform/services/host/src/agentp_host/service.py"
+            description: "Existing host service — add monitor and memory sync"
+        verification:
+          - "Monitor returns resource stats"
+          - "Memory tree from memory service"
+          - "Memory upload/download delegates correctly"
+        acceptance_criteria:
+          - "GET /agents/{id}/monitor returns CPU/memory/token stats per §4.2"
+          - "Memory sync endpoints (tree/upload/download) per §4.2"
+          - "Monitor data cached in Redis"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "Redis"
+          - "pytest"
+        test_coverage: "host_monitor"
+    acceptance_criteria:
+      - "All §4.2 Agent instance endpoints fully implemented"
+      - "Batch operations with per-item status"
+      - "Skills, MCP, config, monitor, memory sync all functional"
+    estimated_effort: "L"
+    note: "Removed P6 dependency — host advanced ops don't need gateway rate limiting. Removed process pool from scope (future work)."
+
+  # ============================================================================
+  # P8: EVENT BUS INTEGRATION (outlined)
+  # ============================================================================
+  - id: M8-eventbus-integration
+    phase: P8
+    name: "Event Bus Integration"
+    description: "Activate EventBus across all 8 services — publish lifecycle events, subscribe to relevant topics, verify cross-service event flow"
+    agent: gem-implementer
+    tasks:
+      - id: T8.1
+        name: "EventBus initialization in all service lifespans"
+        tdd:
+          test: |
+            Write tests in tests/test_eventbus_init.py:
+            - Each service (gateway, auth, host, scheduler, memory, market, billing) initializes EventBus in lifespan
+            - EventBus creates Redis consumer groups on startup (group name = service name)
+            - Service shutdown gracefully closes EventBus connection
+            - Verify consumer groups exist in Redis: XINFO GROUPS event:<topic>
+          implement: |
+            For each service's main.py lifespan handler:
+            - Get Redis connection from shared.redis.get_redis()
+            - Create EventBus(redis) instance
+            - Register topic subscribers via bus.subscribe(topic, handler)
+            - Store bus in app.state for access in routes
+            - On shutdown: await bus.close()
+            Topic subscriptions per service:
+            - auth: permission.changed, user.created
+            - host: (publishes only) agent.created, agent.destroyed, agent.status_changed, agent.usage
+            - scheduler: agent.created, agent.destroyed, agent.usage, billing.alert, approval.requested
+            - billing: agent.usage, agent.created
+            - market: (publishes only) template.published
+            - gateway: (publishes only) audit.request
+          verify: "pytest tests/test_eventbus_init.py -v"
+          smoke_test: "All 7 health check tests pass (no regressions)"
+          production_test: |
+            Start all services → redis-cli XINFO GROUPS → verify consumer groups for each service
+            Stop all → verify groups cleaned up
+        estimated_files: 8
+        estimated_lines: 300
+        priority: "high"
+        status: "pending"
+        dependencies: ["T5.4"]
+        context_files:
+          - path: "agent-platform/services/shared/src/agentp_shared/event_bus.py"
+            description: "EventBus implementation — currently unused, activate here"
+          - path: "agent-platform/services/*/src/agentp_*/main.py"
+            description: "Each service's main.py — add EventBus init in lifespan"
+        verification:
+          - "All 7 services create EventBus on startup"
+          - "Consumer groups exist in Redis"
+          - "Graceful shutdown closes connections"
+        acceptance_criteria:
+          - "EventBus initialized in every service lifespan"
+          - "Topic subscriptions registered per service"
+          - "Redis Streams consumer groups created"
+        failure_modes:
+          - scenario: "Redis connection failure prevents service startup"
+            likelihood: low
+            impact: high
+            mitigation: "Log error but allow service to start in degraded mode (no events)"
+        tech_stack:
+          - "FastAPI"
+          - "Redis Streams"
+          - "pytest"
+        test_coverage: "eventbus_init"
+
+      - id: T8.2
+        name: "Event publishers — lifecycle and usage events"
+        tdd:
+          test: |
+            Write tests in tests/test_eventbus_publish.py:
+            - Host service publishes agent.created on instance creation
+            - Host service publishes agent.destroyed on instance destruction
+            - Host service publishes agent.status_changed on status transition
+            - Host service publishes agent.usage on send_message (with token counts)
+            - Event payload matches schema: { topic, data, source_service, request_id, timestamp }
+            - Events appear in Redis Streams: XRANGE event:agent.created - +
+          implement: |
+            Add event publishing calls to host service:
+            - After create_instance: bus.publish("agent.created", { instance_id, org_id, user_id, name, model })
+            - After destroy_instance: bus.publish("agent.destroyed", { instance_id, org_id })
+            - After status change: bus.publish("agent.status_changed", { instance_id, old_status, new_status })
+            - After send_message: bus.publish("agent.usage", { instance_id, model, input_tokens, output_tokens })
+            Add AuditLog model field: publish on every gateway request.
+          verify: "pytest tests/test_eventbus_publish.py -v"
+          smoke_test: "All host tests pass (existing + new event tests)"
+          production_test: |
+            Create instance → redis-cli XRANGE event:agent.created - + → verify event payload
+            Send message → redis-cli XRANGE event:agent.usage - + → verify token counts
+        estimated_files: 3
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T8.1"]
+        context_files:
+          - path: "agent-platform/services/host/src/agentp_host/service.py"
+            description: "Host service — add event publishing after state changes"
+        verification:
+          - "Events published to Redis Streams with correct payload"
+          - "Schema matches EventBus.Event dataclass"
+          - "request_id propagated from original request"
+        acceptance_criteria:
+          - "agent.created/destroyed/status_changed/usage events published by host"
+          - "Event payload includes instance_id, org_id, user_id"
+          - "Events queryable via Redis XRANGE"
+        failure_modes: []
+        tech_stack:
+          - "FastAPI"
+          - "Redis"
+          - "pytest"
+        test_coverage: "eventbus_publish"
+
+      - id: T8.3
+        name: "Event consumers — billing and scheduler reactions"
+        tdd:
+          test: |
+            Write tests in tests/test_eventbus_consume.py:
+            - Billing subscribes to agent.usage → creates UsageRecord
+            - Billing subscribes to agent.created → initializes billing record for instance
+            - Scheduler subscribes to agent.created → checks if approval needed
+            - Scheduler subscribes to billing.alert → sends notification (log for now)
+            - Events processed at-least-once (consumer group acknowledgment)
+            - Event handler errors logged but do not crash consumer
+          implement: |
+            Add event handlers to billing service:
+            - on_agent_usage(event): extract token counts, INSERT UsageRecord
+            - on_agent_created(event): create initial billing record
+            Add event handlers to scheduler:
+            - on_agent_created(event): check org approval policy, create Approval if needed
+            - on_billing_alert(event): log warning, future: send notification
+            All handlers wrapped in try/except to prevent consumer crash.
+          verify: "pytest tests/test_eventbus_consume.py -v"
+          smoke_test: "All service tests pass"
+          production_test: |
+            Create instance + send message → verify UsageRecord auto-created in DB
+            Set org approval policy → create instance → verify Approval auto-created
+        estimated_files: 3
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T8.2"]
+        context_files:
+          - path: "agent-platform/services/billing/src/agentp_billing/"
+            description: "Billing — add event handlers"
+          - path: "agent-platform/services/scheduler/src/agentp_scheduler/"
+            description: "Scheduler — add event handlers"
+        verification:
+          - "Billing auto-creates UsageRecord on agent.usage event"
+          - "Scheduler auto-creates Approval on agent.created (when policy requires)"
+          - "Error in handler does not crash consumer"
+        acceptance_criteria:
+          - "Billing reacts to agent.usage and agent.created events"
+          - "Scheduler reacts to agent.created and billing.alert events"
+          - "At-least-once delivery via Redis consumer groups"
+          - "Error isolation per handler"
+        failure_modes:
+          - scenario: "Event consumer falls behind during high load"
+            likelihood: low
+            impact: medium
+            mitigation: "Monitor consumer lag; scale consumers if needed; dead letter for failed events"
+        tech_stack:
+          - "FastAPI"
+          - "Redis Streams"
+          - "pytest"
+        test_coverage: "eventbus_consume"
+    acceptance_criteria:
+      - "All 8 services initialize EventBus in lifespan"
+      - "Host publishes 4 event types (created, destroyed, status_changed, usage)"
+      - "Billing and scheduler consume events and react"
+      - "Cross-service event flow verified end-to-end"
+      - "Error isolation per handler"
+    estimated_effort: "M"
+
+  # ============================================================================
+  # P9: INTEGRATION & E2E ACCEPTANCE (outlined)
+  # ============================================================================
+  - id: M9-e2e-acceptance
+    phase: P9
+    name: "Integration & E2E Acceptance"
+    description: "Full cross-service E2E testing, performance benchmarks, production readiness validation, regression suite"
+    agent: gem-implementer
+    tasks:
+      - id: T9.1
+        name: "Full Agent lifecycle E2E test"
+        tdd:
+          test: |
+            Write tests in tests/test_e2e_lifecycle.py:
+            - Complete flow: login → create instance → send message → verify usage → restart → destroy → verify billing record
+            - Each step asserts correct response format per api-protocol
+            - Verify UsageRecord created in billing DB after send_message
+            - Verify audit log entries created for each request
+            - Verify events in Redis Streams: agent.created, agent.usage, agent.destroyed
+          implement: |
+            Write E2E test using httpx.AsyncClient against running gateway:
+            1. POST /auth/login with test_api_key → get JWT
+            2. POST /agents { name, model } → get instance_id
+            3. GET /agents/{id} → verify status becomes running
+            4. POST /agents/{id}/message { prompt: "hello" } → get response
+            5. GET /billing/records?instance_id={id} → verify usage record exists
+            6. POST /agents/{id}/restart → verify ok
+            7. DELETE /agents/{id} → verify ok
+            8. Verify agent.destroyed event in Redis
+            All assertions use api-protocol response format.
+          verify: "pytest tests/test_e2e_lifecycle.py -v"
+          smoke_test: "All existing tests pass (no regressions)"
+          production_test: "Run on clean environment (fresh DB) — full lifecycle passes end-to-end"
+        estimated_files: 2
+        estimated_lines: 200
+        priority: "high"
+        status: "pending"
+        dependencies: ["T8.3"]
+        context_files:
+          - path: "agent-platform/tests/test_e2e_full_chain.py"
+            description: "Existing E2E test — extend with full lifecycle coverage"
+        verification:
+          - "All steps complete without errors"
+          - "Response formats match api-protocol"
+          - "Usage records created"
+          - "Audit logs created"
+          - "Events published"
+        acceptance_criteria:
+          - "Full Agent lifecycle E2E test passes"
+          - "Covers: auth → create → interact → usage → restart → destroy"
+          - "Verifies billing and audit data"
+        failure_modes: []
+        tech_stack:
+          - "pytest"
+          - "httpx"
+          - "Redis"
+        test_coverage: "e2e_lifecycle"
+
+      - id: T9.2
+        name: "Approval workflow E2E test"
+        tdd:
+          test: |
+            Write tests in tests/test_e2e_approval.py:
+            - Set org approval policy (via config center or direct DB)
+            - Login as regular user → request instance → verify approval created (status=pending)
+            - Login as admin → GET /approvals?status=pending → verify approval in list
+            - POST /approvals/{id}/approve → verify instance created
+            - POST /approvals/{id}/reject → verify instance NOT created, reason recorded
+            - Verify approval history endpoint
+          implement: |
+            Write E2E test:
+            1. Configure org to require approval for new instances
+            2. Login as member → POST /agents → expect { task_id } but instance status = pending_approval
+            3. Login as admin → GET /approvals → find pending approval
+            4. POST /approvals/{id}/approve → verify instance created via event
+            5. Test rejection: repeat with reject → verify no instance created
+          verify: "pytest tests/test_e2e_approval.py -v"
+          smoke_test: "All E2E tests pass"
+          production_test: "Run on clean environment — approval flow passes"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T9.1"]
+        context_files:
+          - path: "agent-platform/tests/"
+            description: "Test directory — add approval E2E test"
+        verification:
+          - "Approval created when policy requires"
+          - "Approve triggers instance creation"
+          - "Reject prevents instance creation"
+          - "History records all actions"
+        acceptance_criteria:
+          - "Approval workflow E2E passes end-to-end"
+          - "Tests both approve and reject paths"
+        failure_modes: []
+        tech_stack:
+          - "pytest"
+          - "httpx"
+        test_coverage: "e2e_approval"
+
+      - id: T9.3
+        name: "Market → Builder flow E2E test"
+        tdd:
+          test: |
+            Write tests in tests/test_e2e_builder.py:
+            - Browse marketplace templates → select one
+            - POST /builder/configs with full 11-dimension config
+            - Validate config via POST /builder/configs/validate
+            - Publish config to market via POST /builder/configs/{id}/publish
+            - Create instance from published config via POST /agents { agent_config_id }
+            - Verify instance uses config settings
+          implement: |
+            Write E2E test:
+            1. GET /market/templates → pick a template
+            2. POST /builder/configs with AgentConfig body (all 11 dimensions)
+            3. POST /builder/configs/validate → verify { valid: true }
+            4. POST /builder/configs/{id}/publish { visibility: "org" }
+            5. GET /market/templates → verify published template appears
+            6. POST /agents { agent_config_id: cfg.id } → verify instance created with config
+          verify: "pytest tests/test_e2e_builder.py -v"
+          smoke_test: "All E2E tests pass"
+          production_test: "Run on clean environment — builder flow passes"
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "high"
+        status: "pending"
+        dependencies: ["T9.2"]
+        context_files:
+          - path: "agent-platform/tests/"
+            description: "Test directory — add builder E2E test"
+        verification:
+          - "Config created and validated"
+          - "Published to marketplace"
+          - "Instance created from config"
+          - "Config settings applied to instance"
+        acceptance_criteria:
+          - "Builder → Publish → Instance creation flow passes"
+          - "Config validation catches errors"
+          - "Published config visible in marketplace"
+        failure_modes: []
+        tech_stack:
+          - "pytest"
+          - "httpx"
+        test_coverage: "e2e_builder"
+
+      - id: T9.4
+        name: "Performance benchmarks and regression suite"
+        tdd:
+          test: |
+            Write tests in tests/test_performance.py:
+            - CRUD latency: GET/POST/PUT/DELETE on agents, billing, market endpoints
+            - Target: p95 < 200ms for CRUD operations
+            - Instance creation: p95 < 2s (includes SDK noop init)
+            - Billing summary: p95 < 500ms (includes aggregation)
+            - Full test suite regression: pytest tests/ — all pass, zero failures
+            - Concurrent requests: 10 parallel requests via asyncio.gather
+          implement: |
+            Write benchmark suite:
+            - Use time.perf_counter() around httpx requests
+            - Run N iterations per endpoint, collect latencies
+            - Calculate p50, p90, p95, p99
+            - Assert p95 against targets
+            - Run full test suite and report total time
+          verify: "pytest tests/test_performance.py -v"
+          smoke_test: "Full test suite (all tests/) passes with zero failures"
+          production_test: |
+            Run on production-like environment:
+            pytest tests/ -v → all pass
+            pytest tests/test_performance.py -v → all benchmarks meet targets
+        estimated_files: 2
+        estimated_lines: 150
+        priority: "medium"
+        status: "pending"
+        dependencies: ["T9.3"]
+        context_files:
+          - path: "agent-platform/tests/"
+            description: "Test directory — add performance benchmarks"
+        verification:
+          - "CRUD endpoints meet latency targets"
+          - "Instance creation meets 2s target"
+          - "Zero regressions in existing tests"
+        acceptance_criteria:
+          - "CRUD p95 < 200ms"
+          - "Instance creation p95 < 2s"
+          - "Billing summary p95 < 500ms"
+          - "Full test suite: zero failures, zero regressions"
+        failure_modes:
+          - scenario: "Benchmarks fail on CI due to resource constraints"
+            likelihood: medium
+            impact: low
+            mitigation: "Use relative baselines; skip benchmarks in CI if needed"
+        tech_stack:
+          - "pytest"
+          - "httpx"
+          - "asyncio"
+        test_coverage: "performance"
+    acceptance_criteria:
+      - "3 E2E test suites pass: lifecycle, approval, builder"
+      - "Performance benchmarks meet latency targets"
+      - "Zero regressions in full test suite"
+      - "Production deployment verified on clean environment"
+    estimated_effort: "L"
